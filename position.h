@@ -51,8 +51,8 @@ struct Position {
   U64 scratchzobrist();
   void initialize();
   bool twokings();
-  bool bareking(int color);
-  int material();
+  bool bareking(bool color);
+  int material() const;
   U64 checkers(int color);
   void makemove(Move mov);
   void unmakemove(Move mov);
@@ -61,12 +61,11 @@ struct Position {
   U64 perftnobulk(int depth, int initialdepth);
   void parseFEN(std::string FEN);
   std::string getFEN();
-  bool see_exceeds(Move mov, int threshold);
 };
 
 void initializeleaperattacks();
 void initializemasks();
 void initializerankattacks();
 void initializezobrist();
-std::string algebraic(int notation);
+std::string algebraic(Move mov);
 std::string get129600FEN(int seed1, int seed2);

@@ -227,10 +227,10 @@ void Position::initialize() {
 bool Position::twokings() {
   return (Bitboards[White] | Bitboards[Black]) == Bitboards[King];
 }
-bool Position::bareking(int color) {
+bool Position::bareking(bool color) {
   return (Bitboards[color] & Bitboards[King]) == Bitboards[color];
 }
-int Position::material() {
+int Position::material() const {
   int material_values[5] = {100, 100, 170, 370, 640};
   int value = 0;
   for (int i = Pawn; i < King; i++) {
@@ -662,129 +662,4 @@ std::string Position::getFEN() {
   reverse(bruh.begin(), bruh.end());
   FEN = FEN + bruh + " 1";
   return FEN;
-}
-bool Position::see_exceeds(Move mov, int threshold) {
-  int see_values[6] = {100, 100, 170, 370, 640, 20000};
-  int source = mov.from();
-  int target = mov.to();
-  PieceType victim = mov.captured();
-  PieceType attacker = pieces[source].type();
-
-  int value = (victim > 0) ? see_values[victim - 2] - threshold : -threshold;
-  if (value < 0) {
-    return false;
-  }
-  if (attacker == 7 || value - see_values[attacker - 2] >= 0) {
-    return true;
-  }
-
-  U64 occupied = (Bitboards[0] | Bitboards[1]) ^ bitboard(source);
-  U64 us = Bitboards[stm] & occupied;
-  U64 enemy = Bitboards[stm ^ 1];
-
-  bool ourturn = false;
-  int piececountus[6] = {-1, -1, -1, -1, -1, -1};
-  int piececountopp[6] = {-1, -1, -1, -1, -1, -1};
-  int currpieceus = attacker - 2;
-  int currpieceopp = 0;
-  int nextpieceus = 0;
-  int nextpieceopp = 0;
-  while (true) {
-    if (ourturn) {
-      bool end = false;
-      while (!end) {
-        if (nextpieceus > 5) {
-          return (value >= 0);
-        }
-        if (piececountus[nextpieceus] < 0) {
-          switch (nextpieceus) {
-          case 0:
-            piececountus[nextpieceus] =
-                std::popcount(PawnAttacks[stm ^ 1][target] & Bitboards[2] & us);
-            break;
-          case 1:
-            piececountus[nextpieceus] =
-                std::popcount(AlfilAttacks[target] & Bitboards[3] & us);
-            break;
-          case 2:
-            piececountus[nextpieceus] =
-                std::popcount(FerzAttacks[target] & Bitboards[4] & us);
-            break;
-          case 3:
-            piececountus[nextpieceus] =
-                std::popcount(KnightAttacks[target] & Bitboards[5] & us);
-            break;
-          case 4:
-            piececountus[nextpieceus] = std::popcount(
-                (FileAttacks(occupied & ~(Bitboards[6] & us), target) |
-                 GetRankAttacks(occupied & ~(Bitboards[6] & us), target)) &
-                Bitboards[6] & us);
-            break;
-          case 5:
-            piececountus[nextpieceus] =
-                std::popcount(KingAttacks[target] & Bitboards[7] & us);
-          }
-        }
-        if (piececountus[nextpieceus] == 0) {
-          nextpieceus++;
-        } else {
-          value += see_values[currpieceopp];
-          if (value - see_values[nextpieceus] >= 0) {
-            return true;
-          }
-          piececountus[nextpieceus]--;
-          currpieceus = nextpieceus;
-          end = true;
-        }
-      }
-    } else {
-      bool end = false;
-      while (!end) {
-        if (nextpieceopp > 5) {
-          return (value >= 0);
-        }
-        if (piececountopp[nextpieceopp] < 0) {
-          switch (nextpieceopp) {
-          case 0:
-            piececountopp[nextpieceopp] =
-                std::popcount(PawnAttacks[stm][target] & Bitboards[2] & enemy);
-            break;
-          case 1:
-            piececountopp[nextpieceopp] =
-                std::popcount(AlfilAttacks[target] & Bitboards[3] & enemy);
-            break;
-          case 2:
-            piececountopp[nextpieceopp] =
-                std::popcount(FerzAttacks[target] & Bitboards[4] & enemy);
-            break;
-          case 3:
-            piececountopp[nextpieceopp] =
-                std::popcount(KnightAttacks[target] & Bitboards[5] & enemy);
-            break;
-          case 4:
-            piececountopp[nextpieceopp] = std::popcount(
-                (FileAttacks(occupied & ~(Bitboards[6] & enemy), target) |
-                 GetRankAttacks(occupied & ~(Bitboards[6] & enemy), target)) &
-                Bitboards[6] & enemy);
-            break;
-          case 5:
-            piececountopp[nextpieceopp] =
-                std::popcount(KingAttacks[target] & Bitboards[7] & enemy);
-          }
-        }
-        if (piececountopp[nextpieceopp] == 0) {
-          nextpieceopp++;
-        } else {
-          value -= see_values[currpieceus];
-          if (value + see_values[nextpieceopp] < 0) {
-            return false;
-          }
-          piececountopp[nextpieceopp]--;
-          currpieceopp = nextpieceopp;
-          end = true;
-        }
-      }
-    }
-    ourturn = !ourturn;
-  }
 }
