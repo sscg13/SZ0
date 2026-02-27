@@ -1,6 +1,7 @@
 #include <cstdint>
 #pragma once
 using U64 = uint64_t;
+using U16 = uint16_t;
 using U8 = uint8_t;
 using I32 = int32_t;
 using I16 = int16_t;
@@ -35,3 +36,14 @@ const int EXPECTED_ALL_NODE = 2;
 const int EXPECTED_CUT_NODE = 1;
 constexpr int maxmaxdepth = 64;
 constexpr int maxmoves = 128;
+constexpr bool White = false;
+constexpr bool Black = true;
+enum PieceType : U8 {
+  None = 0,
+  Pawn = 2,
+  Alfil = 3,
+  Ferz = 4,
+  Knight = 5,
+  Rook = 6,
+  King = 7
+};

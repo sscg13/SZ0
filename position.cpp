@@ -1,5 +1,6 @@
 #include "position.h"
 #include "consts.h"
+#include <bit>
 U64 KingAttacks[64];
 U64 PawnAttacks[2][64];
 U64 AlfilAttacks[64];
@@ -14,6 +15,7 @@ U64 shift_w(U64 bitboard) { return (bitboard & ~FileA) >> 1; }
 U64 shift_n(U64 bitboard) { return bitboard << 8; }
 U64 shift_s(U64 bitboard) { return bitboard >> 8; }
 U64 shift_e(U64 bitboard) { return (bitboard & ~FileH) << 1; }
+U64 bitboard(int square) { return 1ULL << square; }
 void initializeleaperattacks() {
   for (int i = 0; i < 64; i++) {
     U64 square = 1ULL << i;
@@ -56,8 +58,8 @@ void initializerankattacks() {
       if (j > 0) {
         int k = j - 1;
         while (k >= 0) {
-          attacks |= (1ULL << k);
-          if ((1ULL << k) & occupied) {
+          attacks |= bitboard(k);
+          if (bitboard(k) & occupied) {
             k = 0;
           }
           k--;
@@ -66,8 +68,8 @@ void initializerankattacks() {
       if (j < 7) {
         int k = j + 1;
         while (k <= 7) {
-          attacks |= (1ULL << k);
-          if ((1ULL << k) & occupied) {
+          attacks |= bitboard(k);
+          if (bitboard(k) & occupied) {
             k = 7;
           }
           k++;
@@ -79,10 +81,10 @@ void initializerankattacks() {
 }
 U64 FileAttacks(U64 occupied, int square) {
   U64 forwards = occupied & FileMask[square];
-  U64 backwards = __builtin_bswap64(forwards);
-  forwards = forwards - 2 * (1ULL << square);
-  backwards = backwards - 2 * (1ULL << (56 ^ square));
-  backwards = __builtin_bswap64(backwards);
+  U64 backwards = std::byteswap(forwards);
+  forwards = forwards - 2 * bitboard(square);
+  backwards = backwards - 2 * bitboard((56 ^ square));
+  backwards = std::byteswap(backwards);
   return (forwards ^ backwards) & FileMask[square];
 }
 U64 GetRankAttacks(U64 occupied, int square) {
@@ -99,7 +101,7 @@ void initializezobrist() {
     }
   }
 }
-std::string algebraic(int notation) {
+std::string algebraic(Move mov) {
   std::string convert[64] = {
       "a1", "b1", "c1", "d1", "e1", "f1", "g1", "h1", "a2", "b2", "c2",
       "d2", "e2", "f2", "g2", "h2", "a3", "b3", "c3", "d3", "e3", "f3",
@@ -107,8 +109,8 @@ std::string algebraic(int notation) {
       "b5", "c5", "d5", "e5", "f5", "g5", "h5", "a6", "b6", "c6", "d6",
       "e6", "f6", "g6", "h6", "a7", "b7", "c7", "d7", "e7", "f7", "g7",
       "h7", "a8", "b8", "c8", "d8", "e8", "f8", "g8", "h8"};
-  std::string header = convert[notation & 63] + convert[(notation >> 6) & 63];
-  if (notation & (1 << 20)) {
+  std::string header = convert[mov.from()] + convert[mov.to()];
+  if (mov.promoted()) {
     header = header + "q";
   }
   return header;
@@ -189,10 +191,10 @@ std::string get129600FEN(int seed1, int seed2) {
 U64 Position::scratchzobrist() {
   U64 scratch = 0ULL;
   for (int i = 0; i < 64; i++) {
-    int piece = pieces[i];
-    if (piece > 0) {
-      scratch ^= hashes[piece / 8][i];
-      scratch ^= hashes[piece % 8][i];
+    Piece piece = pieces[i];
+    if (piece.type() > 0) {
+      scratch ^= hashes[piece.color()][i];
+      scratch ^= hashes[piece.type()][i];
     }
   }
   if (stm) {
@@ -210,401 +212,280 @@ void Position::initialize() {
   Bitboards[6] = (Rank1 | Rank8) & (FileA | FileH);
   Bitboards[7] = (Rank1 | Rank8) & FileD;
   stm = 0;
-  int startpiece[16] = {4, 3, 1, 5, 2, 1, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0};
+  PieceType startpiece[16] = {Rook,   Knight, Alfil, King, Ferz, Alfil,
+                              Knight, Rook,   Pawn,  Pawn, Pawn, Pawn,
+                              Pawn,   Pawn,   Pawn,  Pawn};
   for (int i = 0; i < 16; i++) {
-    pieces[i] = 2 + startpiece[i];
-    pieces[56 ^ i] = 10 + startpiece[i];
+    pieces[i] = Piece(White, startpiece[i]);
+    pieces[56 ^ i] = Piece(Black, startpiece[i]);
   }
   for (int i = 16; i < 48; i++) {
-    pieces[i] = 0;
+    pieces[i] = Piece();
   }
   zobristhash = scratchzobrist();
 }
-bool Position::twokings() { return (Bitboards[0] | Bitboards[1]) == Bitboards[7]; }
+bool Position::twokings() {
+  return (Bitboards[White] | Bitboards[Black]) == Bitboards[King];
+}
 bool Position::bareking(int color) {
-  return (Bitboards[color] & Bitboards[7]) == Bitboards[color];
+  return (Bitboards[color] & Bitboards[King]) == Bitboards[color];
 }
 int Position::material() {
-  return __builtin_popcountll(Bitboards[2]) +
-         __builtin_popcountll(Bitboards[3]) +
-         2 * __builtin_popcountll(Bitboards[4]) +
-         4 * __builtin_popcountll(Bitboards[5]) +
-         6 * __builtin_popcountll(Bitboards[6]);
+  int material_values[5] = {100, 100, 170, 370, 640};
+  int value = 0;
+  for (int i = Pawn; i < King; i++) {
+    value += material_values[i - 2] *
+             (std::popcount(Bitboards[stm] & Bitboards[i]) -
+              std::popcount(Bitboards[!stm] & Bitboards[i]));
+  }
+  return value;
 }
 U64 Position::checkers(int color) {
-  int kingsquare = __builtin_ctzll(Bitboards[color] & Bitboards[7]);
+  int kingsquare = std::countr_zero(Bitboards[color] & Bitboards[King]);
   int opposite = color ^ 1;
   U64 attacks = 0ULL;
-  U64 occupied = Bitboards[0] | Bitboards[1];
-  attacks |= (KnightAttacks[kingsquare] & Bitboards[5]);
-  attacks |= (PawnAttacks[color][kingsquare] & Bitboards[2]);
-  attacks |= (AlfilAttacks[kingsquare] & Bitboards[3]);
-  attacks |= (FerzAttacks[kingsquare] & Bitboards[4]);
-  attacks |= (GetRankAttacks(occupied, kingsquare) & Bitboards[6]);
-  attacks |= (FileAttacks(occupied, kingsquare) & Bitboards[6]);
+  U64 occupied = Bitboards[White] | Bitboards[Black];
+  attacks |= (KnightAttacks[kingsquare] & Bitboards[Knight]);
+  attacks |= (PawnAttacks[color][kingsquare] & Bitboards[Pawn]);
+  attacks |= (AlfilAttacks[kingsquare] & Bitboards[Alfil]);
+  attacks |= (FerzAttacks[kingsquare] & Bitboards[Ferz]);
+  attacks |= (GetRankAttacks(occupied, kingsquare) & Bitboards[Rook]);
+  attacks |= (FileAttacks(occupied, kingsquare) & Bitboards[Rook]);
   attacks &= Bitboards[opposite];
   return attacks;
 }
-U64 Position::keyafter(int notation) {
-  int from = notation & 63;
-  int to = (notation >> 6) & 63;
-  int color = (notation >> 12) & 1;
-  int piece = (notation >> 13) & 7;
-  int captured = (notation >> 17) & 7;
-  int promoted = (notation >> 20) & 1;
-  int piece2 = (promoted > 0) ? 4 : piece;
-  U64 change = (colorhash ^ hashes[color][from] ^ hashes[color][to] ^
-                hashes[piece][from] ^ hashes[piece2][to]);
-  if (captured) {
-    change ^= (hashes[color ^ 1][to] ^ hashes[captured][to]);
-  }
-  return zobristhash ^ change;
-}
-void Position::makemove(int notation) {
-  // 6 bits from square, 6 bits to square, 1 bit color, 3 bits piece moved, 1
-  // bit capture, 3 bits piece captured, 1 bit promotion, 21 bits total
+void Position::makemove(Move mov) {
+  int from = mov.from();
+  int to = mov.to();
+  U8 captured = mov.captured();
+  PieceType type = pieces[from].type();
 
-  // 1 bit color, 7 bits halfmove
-  int from = notation & 63;
-  int to = (notation >> 6) & 63;
-  int color = (notation >> 12) & 1;
-  int piece = (notation >> 13) & 7;
-  Bitboards[color] ^= ((1ULL << from) | (1ULL << to));
-  Bitboards[piece] ^= ((1ULL << from) | (1ULL << to));
+  Bitboards[stm] ^= (bitboard(from) | bitboard(to));
+  Bitboards[type] ^= (bitboard(from) | bitboard(to));
   pieces[to] = pieces[from];
-  pieces[from] = 0;
-  zobristhash ^= (hashes[color][from] ^ hashes[color][to]);
-  zobristhash ^= (hashes[piece][from] ^ hashes[piece][to]);
-  int captured = (notation >> 17) & 7;
+  pieces[from] = Piece();
+  zobristhash ^= (hashes[stm][from] ^ hashes[stm][to]);
+  zobristhash ^= (hashes[type][from] ^ hashes[type][to]);
   halfmovecount++;
-  if (piece == 2) {
+  if (type == Pawn) {
     halfmovecount = 0;
   }
-  if (notation & (1 << 16)) {
-    Bitboards[color ^ 1] ^= (1ULL << to);
-    Bitboards[captured] ^= (1ULL << to);
-    zobristhash ^= (hashes[color ^ 1][to] ^ hashes[captured][to]);
+  if (captured != None) {
+    Bitboards[!stm] ^= bitboard(to);
+    Bitboards[captured] ^= bitboard(to);
+    zobristhash ^= (hashes[!stm][to] ^ hashes[captured][to]);
     halfmovecount = 0;
   }
-  if (notation & (1 << 20)) {
-    Bitboards[2] ^= (1ULL << to);
-    Bitboards[4] ^= (1ULL << to);
-    pieces[to] = 8 * color + 4;
-    zobristhash ^= (hashes[2][to] ^ hashes[4][to]);
+  if (mov.promoted()) {
+    Bitboards[Pawn] ^= bitboard(to);
+    Bitboards[Ferz] ^= bitboard(to);
+    pieces[to] = Piece(stm, Ferz);
+    zobristhash ^= (hashes[Pawn][to] ^ hashes[Ferz][to]);
   }
   stm = !stm;
   zobristhash ^= colorhash;
 }
-void Position::unmakemove(int notation) {
-  int from = notation & 63;
-  int to = (notation >> 6) & 63;
-  int color = (notation >> 12) & 1;
-  int piece = (notation >> 13) & 7;
-  Bitboards[color] ^= ((1ULL << from) | (1ULL << to));
-  Bitboards[piece] ^= ((1ULL << from) | (1ULL << to));
+void Position::unmakemove(Move mov) {
+  stm = !stm;
+  int from = mov.from();
+  int to = mov.to();
+  PieceType captured = mov.captured();
+  PieceType type = pieces[to].type();
+
+  Bitboards[stm] ^= (bitboard(from) | bitboard(to));
+  Bitboards[type] ^= (bitboard(from) | bitboard(to));
   pieces[from] = pieces[to];
-  pieces[to] = 0;
-  int captured = (notation >> 17) & 7;
-  if (notation & (1 << 16)) {
-    Bitboards[color ^ 1] ^= (1ULL << to);
-    Bitboards[captured] ^= (1ULL << to);
-    pieces[to] = 8 * (color ^ 1) + captured;
+  pieces[to] = Piece();
+  if (captured != None) {
+    Bitboards[!stm] ^= bitboard(to);
+    Bitboards[captured] ^= bitboard(to);
+    pieces[to] = Piece(!stm, captured);
   }
-  if (notation & (1 << 20)) {
-    Bitboards[2] ^= (1ULL << to);
-    Bitboards[4] ^= (1ULL << to);
-    pieces[from] = 8 * color + 2;
+  if (mov.promoted()) {
+    Bitboards[Pawn] ^= bitboard(from);
+    Bitboards[Ferz] ^= bitboard(from);
+    pieces[from] = Piece(stm, Pawn);
   }
 }
-int Position::generatemoves(int color, bool capturesonly, int *movelist) {
+int Position::generatemoves(Move *movelist) {
   int movecount = 0;
-  int kingsquare = __builtin_ctzll(Bitboards[color] & Bitboards[7]);
+  int kingsquare = std::countr_zero(Bitboards[stm] & Bitboards[King]);
   int pinrank = kingsquare & 56;
   int pinfile = kingsquare & 7;
-  int opposite = color ^ 1;
   U64 opponentattacks = 0ULL;
   U64 pinnedpieces = 0ULL;
   U64 checkmask = 0ULL;
-  U64 preoccupied = Bitboards[0] | Bitboards[1];
+  U64 preoccupied = Bitboards[White] | Bitboards[Black];
   U64 kingRank = GetRankAttacks(preoccupied, kingsquare);
   U64 kingFile = FileAttacks(preoccupied, kingsquare);
-  U64 occupied = preoccupied ^ (1ULL << kingsquare);
-  U64 opponentpawns = Bitboards[opposite] & Bitboards[2];
-  U64 opponentalfils = Bitboards[opposite] & Bitboards[3];
-  U64 opponentferzes = Bitboards[opposite] & Bitboards[4];
-  U64 opponentknights = Bitboards[opposite] & Bitboards[5];
-  U64 opponentrooks = Bitboards[opposite] & Bitboards[6];
-  int pawncount = __builtin_popcountll(opponentpawns);
-  int alfilcount = __builtin_popcountll(opponentalfils);
-  int ferzcount = __builtin_popcountll(opponentferzes);
-  int knightcount = __builtin_popcountll(opponentknights);
-  int rookcount = __builtin_popcountll(opponentrooks);
-  U64 ourcaptures = 0ULL;
+  U64 occupied = preoccupied ^ bitboard(kingsquare);
+  U64 opponentpawns = Bitboards[!stm] & Bitboards[Pawn];
+  U64 opponentalfils = Bitboards[!stm] & Bitboards[Alfil];
+  U64 opponentferzes = Bitboards[!stm] & Bitboards[Ferz];
+  U64 opponentknights = Bitboards[!stm] & Bitboards[Knight];
+  U64 opponentrooks = Bitboards[!stm] & Bitboards[Rook];
+  int pawncount = std::popcount(opponentpawns);
+  int alfilcount = std::popcount(opponentalfils);
+  int ferzcount = std::popcount(opponentferzes);
+  int knightcount = std::popcount(opponentknights);
+  int rookcount = std::popcount(opponentrooks);
   U64 ourmoves = 0ULL;
   U64 ourmask = 0ULL;
   for (int i = 0; i < pawncount; i++) {
-    int pawnsquare = __builtin_ctzll(opponentpawns);
-    opponentattacks |= PawnAttacks[opposite][pawnsquare];
-    opponentpawns ^= (1ULL << pawnsquare);
+    int pawnsquare = std::countr_zero(opponentpawns);
+    opponentattacks |= PawnAttacks[!stm][pawnsquare];
+    opponentpawns ^= bitboard(pawnsquare);
   }
   U64 opponentpawnattacks = opponentattacks;
   for (int i = 0; i < alfilcount; i++) {
-    int alfilsquare = __builtin_ctzll(opponentalfils);
+    int alfilsquare = std::countr_zero(opponentalfils);
     opponentattacks |= AlfilAttacks[alfilsquare];
-    opponentalfils ^= (1ULL << alfilsquare);
+    opponentalfils ^= bitboard(alfilsquare);
   }
   U64 opponentalfilattacks = opponentattacks;
   for (int i = 0; i < ferzcount; i++) {
-    int ferzsquare = __builtin_ctzll(opponentferzes);
+    int ferzsquare = std::countr_zero(opponentferzes);
     opponentattacks |= FerzAttacks[ferzsquare];
-    opponentferzes ^= (1ULL << ferzsquare);
+    opponentferzes ^= bitboard(ferzsquare);
   }
   U64 opponentferzattacks = opponentattacks;
   for (int i = 0; i < knightcount; i++) {
-    int knightsquare = __builtin_ctzll(opponentknights);
+    int knightsquare = std::countr_zero(opponentknights);
     opponentattacks |= KnightAttacks[knightsquare];
-    opponentknights ^= (1ULL << knightsquare);
+    opponentknights ^= bitboard(knightsquare);
   }
   U64 opponentknightattacks = opponentattacks;
   for (int i = 0; i < rookcount; i++) {
-    int rooksquare = __builtin_ctzll(opponentrooks);
+    int rooksquare = std::countr_zero(opponentrooks);
     U64 r = GetRankAttacks(occupied, rooksquare);
     U64 file = FileAttacks(occupied, rooksquare);
-    if (!(r & (1ULL << kingsquare))) {
+    if (!(r & bitboard(kingsquare))) {
       pinnedpieces |= (r & kingRank);
     } else {
       checkmask |= (GetRankAttacks(preoccupied, rooksquare) & kingRank);
     }
-    if (!(file & (1ULL << kingsquare))) {
+    if (!(file & bitboard(kingsquare))) {
       pinnedpieces |= (file & kingFile);
     } else {
       checkmask |= (FileAttacks(preoccupied, rooksquare) & kingFile);
     }
     opponentattacks |= (r | file);
-    opponentrooks ^= (1ULL << rooksquare);
+    opponentrooks ^= bitboard(rooksquare);
   }
-  int opponentking = __builtin_ctzll(Bitboards[opposite] & Bitboards[7]);
+  int opponentking = std::countr_zero(Bitboards[!stm] & Bitboards[King]);
   opponentattacks |= KingAttacks[opponentking];
-  ourcaptures =
-      KingAttacks[kingsquare] & ((~opponentattacks) & Bitboards[opposite]);
-  int capturenumber = __builtin_popcountll(ourcaptures);
-  int movenumber;
-  for (int i = 0; i < capturenumber; i++) {
-    int capturesquare = __builtin_ctzll(ourcaptures);
-    int captured = pieces[capturesquare] % 8;
-    int notation = kingsquare | (capturesquare << 6);
-    notation |= (color << 12);
-    notation |= (7 << 13);
-    notation |= (1 << 16);
-    notation |= (captured << 17);
-    movelist[movecount] = notation;
+  ourmoves = KingAttacks[kingsquare] & ((~opponentattacks) & (~Bitboards[stm]));
+  int movenumber = std::popcount(ourmoves);
+  for (int i = 0; i < movenumber; i++) {
+    int movesquare = std::countr_zero(ourmoves);
+    PieceType captured = pieces[movesquare].type();
+    movelist[movecount] = Move(kingsquare, movesquare, false, captured);
     movecount++;
-    ourcaptures ^= (1ULL << capturesquare);
+    ourmoves &= (ourmoves - 1);
   }
-  if (!capturesonly) {
-    ourmoves = KingAttacks[kingsquare] & ((~opponentattacks) & (~preoccupied));
-    movenumber = __builtin_popcountll(ourmoves);
-    for (int i = 0; i < movenumber; i++) {
-      int movesquare = __builtin_ctzll(ourmoves);
-      int notation = kingsquare | (movesquare << 6);
-      notation |= (color << 12);
-      notation |= (7 << 13);
-      movelist[movecount] = notation;
-      movecount++;
-      ourmoves ^= (1ULL << movesquare);
-    }
-  }
-  U64 checks = checkers(color);
-  if (__builtin_popcountll(checks) > 1) {
+  U64 checks = checkers(stm);
+  if (std::popcount(checks) > 1) {
     return movecount;
   } else if (checks) {
     checkmask |= checks;
   } else {
     checkmask = ~(0ULL);
   }
-  U64 ourpawns = Bitboards[color] & Bitboards[2];
-  U64 ouralfils = Bitboards[color] & Bitboards[3];
-  U64 ourferzes = Bitboards[color] & Bitboards[4];
-  U64 ourknights = Bitboards[color] & Bitboards[5];
-  U64 ourrooks = Bitboards[color] & Bitboards[6];
-  pawncount = __builtin_popcountll(ourpawns);
-  alfilcount = __builtin_popcountll(ouralfils);
-  ferzcount = __builtin_popcountll(ourferzes);
-  knightcount = __builtin_popcountll(ourknights);
-  rookcount = __builtin_popcountll(ourrooks);
+  U64 movemask = checkmask & (~Bitboards[stm]);
+  U64 ourpawns = Bitboards[stm] & Bitboards[Pawn];
+  U64 ouralfils = Bitboards[stm] & Bitboards[Alfil];
+  U64 ourferzes = Bitboards[stm] & Bitboards[Ferz];
+  U64 ourknights = Bitboards[stm] & Bitboards[Knight];
+  U64 ourrooks = Bitboards[stm] & Bitboards[Rook];
+  pawncount = std::popcount(ourpawns);
+  alfilcount = std::popcount(ouralfils);
+  ferzcount = std::popcount(ourferzes);
+  knightcount = std::popcount(ourknights);
+  rookcount = std::popcount(ourrooks);
   for (int i = 0; i < pawncount; i++) {
-    int pawnsquare = __builtin_ctzll(ourpawns);
-    if ((pinnedpieces & (1ULL << pawnsquare)) &&
+    int pawnsquare = std::countr_zero(ourpawns);
+    if ((pinnedpieces & bitboard(pawnsquare)) &&
         ((pawnsquare & 56) == pinrank)) {
-      ourpawns ^= (1ULL << pawnsquare);
-      continue;
-    } else if ((pinnedpieces & (1ULL << pawnsquare)) && capturesonly) {
-      ourpawns ^= (1ULL << pawnsquare);
+      ourpawns &= (ourpawns - 1);
       continue;
     }
-    int capturenumber = 0;
-    if ((pinnedpieces & (1ULL << pawnsquare)) == 0ULL) {
-      ourcaptures = PawnAttacks[color][pawnsquare] & Bitboards[opposite];
-      ourcaptures &= checkmask;
-      capturenumber = __builtin_popcountll(ourcaptures);
+    ourmoves = bitboard((pawnsquare + 8 * (1 - 2 * stm))) & (~preoccupied);
+    if ((pinnedpieces & bitboard(pawnsquare)) == 0ULL) {
+      ourmoves |= (PawnAttacks[stm][pawnsquare] & Bitboards[!stm]);
     }
-    for (int j = 0; j < capturenumber; j++) {
-      int capturesquare = __builtin_ctzll(ourcaptures);
-      int captured = pieces[capturesquare] % 8;
-      int notation = pawnsquare | (capturesquare << 6);
-      notation |= (color << 12);
-      notation |= (2 << 13);
-      notation |= (1 << 16);
-      notation |= (captured << 17);
-      if (((color == 0) && (capturesquare & 56) == 56) ||
-          ((color == 1) && (capturesquare & 56) == 0)) {
-        movelist[movecount] = notation | (1 << 20);
-        movecount++;
-      } else {
-        movelist[movecount] = notation;
-        movecount++;
-      }
-      ourcaptures ^= (1ULL << capturesquare);
+    ourmoves &= checkmask;
+    movenumber = std::popcount(ourmoves);
+    for (int i = 0; i < movenumber; i++) {
+      int movesquare = std::countr_zero(ourmoves);
+      PieceType captured = pieces[movesquare].type();
+      bool promo =
+          (!stm && (movesquare & 56) == 56) || (stm && (movesquare & 56) == 0);
+      movelist[movecount] = Move(pawnsquare, movesquare, promo, captured);
+      movecount++;
+      ourmoves &= (ourmoves - 1);
     }
-    if (!capturesonly) {
-      ourmoves = (1ULL << (pawnsquare + 8 * (1 - 2 * color))) & (~preoccupied);
-      ourmoves &= checkmask;
-      int movenumber = __builtin_popcountll(ourmoves);
-      for (int j = 0; j < movenumber; j++) {
-        int movesquare = __builtin_ctzll(ourmoves);
-        int notation = pawnsquare | (movesquare << 6);
-        notation |= (color << 12);
-        notation |= (2 << 13);
-        if (((color == 0) && (movesquare & 56) == 56) ||
-            ((color == 1) && (movesquare & 56) == 0)) {
-          movelist[movecount] = notation | (1 << 20);
-          movecount++;
-        } else {
-          movelist[movecount] = notation;
-          movecount++;
-        }
-        ourmoves ^= (1ULL << movesquare);
-      }
-    }
-    ourpawns ^= (1ULL << pawnsquare);
+    ourpawns &= (ourpawns - 1);
   }
   for (int i = 0; i < alfilcount; i++) {
-    int alfilsquare = __builtin_ctzll(ouralfils);
-    if (pinnedpieces & (1ULL << alfilsquare)) {
-      ouralfils ^= (1ULL << alfilsquare);
+    int alfilsquare = std::countr_zero(ouralfils);
+    if (pinnedpieces & bitboard(alfilsquare)) {
+      ouralfils ^= bitboard(alfilsquare);
       continue;
     }
     ourmask = AlfilAttacks[alfilsquare];
-    ourmask &= checkmask;
-    ourcaptures = ourmask & Bitboards[opposite];
-    int capturenumber = __builtin_popcountll(ourcaptures);
-    for (int j = 0; j < capturenumber; j++) {
-      int capturesquare = __builtin_ctzll(ourcaptures);
-      int captured = pieces[capturesquare] % 8;
-      int notation = alfilsquare | (capturesquare << 6);
-      notation |= (color << 12);
-      notation |= (3 << 13);
-      notation |= (1 << 16);
-      notation |= (captured << 17);
-      movelist[movecount] = notation;
+    ourmoves = ourmask & movemask;
+    int movenumber = std::popcount(ourmoves);
+    for (int i = 0; i < movenumber; i++) {
+      int movesquare = std::countr_zero(ourmoves);
+      PieceType captured = pieces[movesquare].type();
+      movelist[movecount] = Move(alfilsquare, movesquare, false, captured);
       movecount++;
-      ourcaptures ^= (1ULL << capturesquare);
+      ourmoves &= (ourmoves - 1);
     }
-    if (!capturesonly) {
-      ourmoves = ourmask & (~preoccupied);
-      int movenumber = __builtin_popcountll(ourmoves);
-      for (int j = 0; j < movenumber; j++) {
-        int movesquare = __builtin_ctzll(ourmoves);
-        int notation = alfilsquare | (movesquare << 6);
-        notation |= (color << 12);
-        notation |= (3 << 13);
-        movelist[movecount] = notation;
-        movecount++;
-        ourmoves ^= (1ULL << movesquare);
-      }
-    }
-    ouralfils ^= (1ULL << alfilsquare);
+    ouralfils &= (ouralfils - 1);
   }
   for (int i = 0; i < ferzcount; i++) {
-    int ferzsquare = __builtin_ctzll(ourferzes);
-    if (pinnedpieces & (1ULL << ferzsquare)) {
-      ourferzes ^= (1ULL << ferzsquare);
+    int ferzsquare = std::countr_zero(ourferzes);
+    if (pinnedpieces & bitboard(ferzsquare)) {
+      ourferzes ^= bitboard(ferzsquare);
       continue;
     }
     ourmask = FerzAttacks[ferzsquare];
-    ourmask &= checkmask;
-    ourcaptures = ourmask & Bitboards[opposite];
-    int capturenumber = __builtin_popcountll(ourcaptures);
-    for (int j = 0; j < capturenumber; j++) {
-      int capturesquare = __builtin_ctzll(ourcaptures);
-      int captured = pieces[capturesquare] % 8;
-      int notation = ferzsquare | (capturesquare << 6);
-      notation |= (color << 12);
-      notation |= (4 << 13);
-      notation |= (1 << 16);
-      notation |= (captured << 17);
-      movelist[movecount] = notation;
+    ourmoves = ourmask & movemask;
+    int movenumber = std::popcount(ourmoves);
+    for (int i = 0; i < movenumber; i++) {
+      int movesquare = std::countr_zero(ourmoves);
+      PieceType captured = pieces[movesquare].type();
+      movelist[movecount] = Move(ferzsquare, movesquare, false, captured);
       movecount++;
-      ourcaptures ^= (1ULL << capturesquare);
+      ourmoves &= (ourmoves - 1);
     }
-    if (!capturesonly) {
-      ourmoves = ourmask & (~preoccupied);
-      int movenumber = __builtin_popcountll(ourmoves);
-      for (int j = 0; j < movenumber; j++) {
-        int movesquare = __builtin_ctzll(ourmoves);
-        int notation = ferzsquare | (movesquare << 6);
-        notation |= (color << 12);
-        notation |= (4 << 13);
-        movelist[movecount] = notation;
-        movecount++;
-        ourmoves ^= (1ULL << movesquare);
-      }
-    }
-    ourferzes ^= (1ULL << ferzsquare);
+    ourferzes &= (ourferzes - 1);
   }
   for (int i = 0; i < knightcount; i++) {
-    int knightsquare = __builtin_ctzll(ourknights);
-    if (pinnedpieces & (1ULL << knightsquare)) {
-      ourknights ^= (1ULL << knightsquare);
+    int knightsquare = std::countr_zero(ourknights);
+    if (pinnedpieces & bitboard(knightsquare)) {
+      ourknights ^= bitboard(knightsquare);
       continue;
     }
     ourmask = KnightAttacks[knightsquare];
-    ourmask &= checkmask;
-    ourcaptures = ourmask & Bitboards[opposite];
-    int capturenumber = __builtin_popcountll(ourcaptures);
-    for (int j = 0; j < capturenumber; j++) {
-      int capturesquare = __builtin_ctzll(ourcaptures);
-      int captured = pieces[capturesquare] % 8;
-      int notation = knightsquare | (capturesquare << 6);
-      notation |= (color << 12);
-      notation |= (5 << 13);
-      notation |= (1 << 16);
-      notation |= (captured << 17);
-      movelist[movecount] = notation;
+    ourmoves = ourmask & movemask;
+    int movenumber = std::popcount(ourmoves);
+    for (int i = 0; i < movenumber; i++) {
+      int movesquare = std::countr_zero(ourmoves);
+      PieceType captured = pieces[movesquare].type();
+      movelist[movecount] = Move(knightsquare, movesquare, false, captured);
       movecount++;
-      ourcaptures ^= (1ULL << capturesquare);
+      ourmoves &= (ourmoves - 1);
     }
-    if (!capturesonly) {
-      ourmoves = ourmask & (~preoccupied);
-      int movenumber = __builtin_popcountll(ourmoves);
-      for (int j = 0; j < movenumber; j++) {
-        int movesquare = __builtin_ctzll(ourmoves);
-        int notation = knightsquare | (movesquare << 6);
-        notation |= (color << 12);
-        notation |= (5 << 13);
-        movelist[movecount] = notation;
-        movecount++;
-        ourmoves ^= (1ULL << movesquare);
-      }
-    }
-    ourknights ^= (1ULL << knightsquare);
+    ourknights &= (ourknights - 1);
   }
   for (int i = 0; i < rookcount; i++) {
-    int rooksquare = __builtin_ctzll(ourrooks);
+    int rooksquare = std::countr_zero(ourrooks);
     ourmask = (GetRankAttacks(preoccupied, rooksquare) |
                FileAttacks(preoccupied, rooksquare));
     U64 pinmask = ~(0ULL);
-    if (pinnedpieces & (1ULL << rooksquare)) {
+    if (pinnedpieces & bitboard(rooksquare)) {
       int rookrank = rooksquare & 56;
       if (rookrank == pinrank) {
         pinmask = GetRankAttacks(preoccupied, rooksquare);
@@ -612,41 +493,22 @@ int Position::generatemoves(int color, bool capturesonly, int *movelist) {
         pinmask = FileAttacks(preoccupied, rooksquare);
       }
     }
-    ourmask &= (pinmask & checkmask);
-    ourcaptures = ourmask & Bitboards[opposite];
-    int capturenumber = __builtin_popcountll(ourcaptures);
-    for (int j = 0; j < capturenumber; j++) {
-      int capturesquare = __builtin_ctzll(ourcaptures);
-      int captured = pieces[capturesquare] % 8;
-      int notation = rooksquare | (capturesquare << 6);
-      notation |= (color << 12);
-      notation |= (6 << 13);
-      notation |= (1 << 16);
-      notation |= (captured << 17);
-      movelist[movecount] = notation;
+    ourmoves = ourmask & movemask & pinmask;
+    int movenumber = std::popcount(ourmoves);
+    for (int i = 0; i < movenumber; i++) {
+      int movesquare = std::countr_zero(ourmoves);
+      PieceType captured = pieces[movesquare].type();
+      movelist[movecount] = Move(rooksquare, movesquare, false, captured);
       movecount++;
-      ourcaptures ^= (1ULL << capturesquare);
+      ourmoves &= (ourmoves - 1);
     }
-    if (!capturesonly) {
-      ourmoves = ourmask & (~preoccupied);
-      int movenumber = __builtin_popcountll(ourmoves);
-      for (int j = 0; j < movenumber; j++) {
-        int movesquare = __builtin_ctzll(ourmoves);
-        int notation = rooksquare | (movesquare << 6);
-        notation |= (color << 12);
-        notation |= (6 << 13);
-        movelist[movecount] = notation;
-        movecount++;
-        ourmoves ^= (1ULL << movesquare);
-      }
-    }
-    ourrooks ^= (1ULL << rooksquare);
+    ourrooks &= (ourrooks - 1);
   }
   return movecount;
 }
-U64 Position::perft(int depth, int initialdepth, int color) {
-  int moves[maxmoves];
-  int movcount = generatemoves(color, 0, moves);
+U64 Position::perft(int depth, int initialdepth) {
+  Move moves[maxmoves];
+  int movcount = generatemoves(moves);
   U64 ans = 0;
   if (depth > 1) {
     for (int i = 0; i < movcount; i++) {
@@ -655,7 +517,7 @@ U64 Position::perft(int depth, int initialdepth, int color) {
         std::cout << algebraic(moves[i]);
         std::cout << ": ";
       }
-      ans += perft(depth - 1, initialdepth, color ^ 1);
+      ans += perft(depth - 1, initialdepth);
       unmakemove(moves[i]);
     }
     if (depth == initialdepth - 1) {
@@ -672,18 +534,18 @@ U64 Position::perft(int depth, int initialdepth, int color) {
     return movcount;
   }
 }
-U64 Position::perftnobulk(int depth, int initialdepth, int color) {
-  int moves[maxmoves];
-  int movcount = generatemoves(color, 0, moves);
+U64 Position::perftnobulk(int depth, int initialdepth) {
+  Move moves[maxmoves];
+  int movcount = generatemoves(moves);
   U64 ans = 0;
   for (int i = 0; i < movcount; i++) {
-    makemove(moves[i], true);
+    makemove(moves[i]);
     if (depth == initialdepth) {
       std::cout << algebraic(moves[i]);
       std::cout << ": ";
     }
     if (depth > 1) {
-      ans += perftnobulk(depth - 1, initialdepth, color ^ 1);
+      ans += perftnobulk(depth - 1, initialdepth);
     } else {
       ans++;
     }
@@ -705,69 +567,32 @@ void Position::parseFEN(std::string FEN) {
   int tracker = 0;
   int castling = 0;
   stm = 0;
+  PieceType types[18] = {Alfil, Alfil,  None, None, Alfil, Ferz,
+                         Ferz,  None,   None, None, King,  None,
+                         None,  Knight, None, Pawn, Ferz,  Rook};
   while (FEN[tracker] != ' ') {
     char hm = FEN[tracker];
+    bool color;
+    PieceType type = None;
     if ('0' <= hm && hm <= '9') {
-      int repeat = (int)hm - 48;
+      int repeat = hm - '0';
       for (int i = 0; i < repeat; i++) {
-        pieces[(56 ^ progress)] = 0;
+        pieces[(56 ^ progress)] = Piece();
         progress++;
       }
     }
-    if ('A' <= hm && hm <= 'Z') {
-      Bitboards[0] |= (1ULL << (56 ^ progress));
-      if (hm == 'P') {
-        Bitboards[2] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 2;
-      }
-      if (hm == 'A' || hm == 'B') {
-        Bitboards[3] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 3;
-      }
-      if (hm == 'F' || hm == 'Q') {
-        Bitboards[4] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 4;
-      }
-      if (hm == 'N') {
-        Bitboards[5] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 5;
-      }
-      if (hm == 'R') {
-        Bitboards[6] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 6;
-      }
-      if (hm == 'K') {
-        Bitboards[7] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 7;
-      }
-      progress++;
+    if ('A' <= hm && hm <= 'R') {
+      color = White;
+      type = types[hm - 'A'];
     }
-    if ('a' <= hm && hm <= 'z') {
-      Bitboards[1] |= (1ULL << (56 ^ progress));
-      if (hm == 'p') {
-        Bitboards[2] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 10;
-      }
-      if (hm == 'a' || hm == 'b') {
-        Bitboards[3] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 11;
-      }
-      if (hm == 'f' || hm == 'q') {
-        Bitboards[4] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 12;
-      }
-      if (hm == 'n') {
-        Bitboards[5] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 13;
-      }
-      if (hm == 'r') {
-        Bitboards[6] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 14;
-      }
-      if (hm == 'k') {
-        Bitboards[7] |= (1ULL << (56 ^ progress));
-        pieces[(56 ^ progress)] = 15;
-      }
+    if ('a' <= hm && hm <= 'r') {
+      color = Black;
+      type = types[hm - 'a'];
+    }
+    if (type != None) {
+      Bitboards[color] ^= bitboard((56 ^ progress));
+      Bitboards[type] ^= bitboard((56 ^ progress));
+      pieces[(56 ^ progress)] = Piece(color, type);
       progress++;
     }
     tracker++;
@@ -796,7 +621,7 @@ std::string Position::getFEN() {
   for (int i = 0; i < 64; i++) {
     color = -1;
     for (int j = 0; j < 2; j++) {
-      if (Bitboards[j] & (1ULL << (56 ^ i))) {
+      if (Bitboards[j] & bitboard((56 ^ i))) {
         color = j;
       }
     }
@@ -806,7 +631,7 @@ std::string Position::getFEN() {
         empt = 0;
       }
       for (int j = 0; j < 6; j++) {
-        if (Bitboards[j + 2] & (1ULL << (56 ^ i))) {
+        if (Bitboards[j + 2] & bitboard((56 ^ i))) {
           piece = j;
         }
       }
@@ -838,11 +663,12 @@ std::string Position::getFEN() {
   FEN = FEN + bruh + " 1";
   return FEN;
 }
-bool Position::see_exceeds(int mov, int threshold) {
+bool Position::see_exceeds(Move mov, int threshold) {
   int see_values[6] = {100, 100, 170, 370, 640, 20000};
-  int target = (mov >> 6) & 63;
-  int victim = (mov >> 17) & 7;
-  int attacker = (mov >> 13) & 7;
+  int source = mov.from();
+  int target = mov.to();
+  PieceType victim = mov.captured();
+  PieceType attacker = pieces[source].type();
 
   int value = (victim > 0) ? see_values[victim - 2] - threshold : -threshold;
   if (value < 0) {
@@ -852,9 +678,9 @@ bool Position::see_exceeds(int mov, int threshold) {
     return true;
   }
 
-  U64 occupied = (Bitboards[0] | Bitboards[1]) ^ (1ULL << (mov & 63));
-  U64 us = Bitboards[color] & occupied;
-  U64 enemy = Bitboards[color ^ 1];
+  U64 occupied = (Bitboards[0] | Bitboards[1]) ^ bitboard(source);
+  U64 us = Bitboards[stm] & occupied;
+  U64 enemy = Bitboards[stm ^ 1];
 
   bool ourturn = false;
   int piececountus[6] = {-1, -1, -1, -1, -1, -1};
@@ -873,30 +699,30 @@ bool Position::see_exceeds(int mov, int threshold) {
         if (piececountus[nextpieceus] < 0) {
           switch (nextpieceus) {
           case 0:
-            piececountus[nextpieceus] = __builtin_popcountll(
-                PawnAttacks[color ^ 1][target] & Bitboards[2] & us);
+            piececountus[nextpieceus] =
+                std::popcount(PawnAttacks[stm ^ 1][target] & Bitboards[2] & us);
             break;
           case 1:
             piececountus[nextpieceus] =
-                __builtin_popcountll(AlfilAttacks[target] & Bitboards[3] & us);
+                std::popcount(AlfilAttacks[target] & Bitboards[3] & us);
             break;
           case 2:
             piececountus[nextpieceus] =
-                __builtin_popcountll(FerzAttacks[target] & Bitboards[4] & us);
+                std::popcount(FerzAttacks[target] & Bitboards[4] & us);
             break;
           case 3:
             piececountus[nextpieceus] =
-                __builtin_popcountll(KnightAttacks[target] & Bitboards[5] & us);
+                std::popcount(KnightAttacks[target] & Bitboards[5] & us);
             break;
           case 4:
-            piececountus[nextpieceus] = __builtin_popcountll(
+            piececountus[nextpieceus] = std::popcount(
                 (FileAttacks(occupied & ~(Bitboards[6] & us), target) |
                  GetRankAttacks(occupied & ~(Bitboards[6] & us), target)) &
                 Bitboards[6] & us);
             break;
           case 5:
             piececountus[nextpieceus] =
-                __builtin_popcountll(KingAttacks[target] & Bitboards[7] & us);
+                std::popcount(KingAttacks[target] & Bitboards[7] & us);
           }
         }
         if (piececountus[nextpieceus] == 0) {
@@ -920,30 +746,30 @@ bool Position::see_exceeds(int mov, int threshold) {
         if (piececountopp[nextpieceopp] < 0) {
           switch (nextpieceopp) {
           case 0:
-            piececountopp[nextpieceopp] = __builtin_popcountll(
-                PawnAttacks[color][target] & Bitboards[2] & enemy);
+            piececountopp[nextpieceopp] =
+                std::popcount(PawnAttacks[stm][target] & Bitboards[2] & enemy);
             break;
           case 1:
-            piececountopp[nextpieceopp] = __builtin_popcountll(
-                AlfilAttacks[target] & Bitboards[3] & enemy);
+            piececountopp[nextpieceopp] =
+                std::popcount(AlfilAttacks[target] & Bitboards[3] & enemy);
             break;
           case 2:
-            piececountopp[nextpieceopp] = __builtin_popcountll(
-                FerzAttacks[target] & Bitboards[4] & enemy);
+            piececountopp[nextpieceopp] =
+                std::popcount(FerzAttacks[target] & Bitboards[4] & enemy);
             break;
           case 3:
-            piececountopp[nextpieceopp] = __builtin_popcountll(
-                KnightAttacks[target] & Bitboards[5] & enemy);
+            piececountopp[nextpieceopp] =
+                std::popcount(KnightAttacks[target] & Bitboards[5] & enemy);
             break;
           case 4:
-            piececountopp[nextpieceopp] = __builtin_popcountll(
+            piececountopp[nextpieceopp] = std::popcount(
                 (FileAttacks(occupied & ~(Bitboards[6] & enemy), target) |
                  GetRankAttacks(occupied & ~(Bitboards[6] & enemy), target)) &
                 Bitboards[6] & enemy);
             break;
           case 5:
-            piececountopp[nextpieceopp] = __builtin_popcountll(
-                KingAttacks[target] & Bitboards[7] & enemy);
+            piececountopp[nextpieceopp] =
+                std::popcount(KingAttacks[target] & Bitboards[7] & enemy);
           }
         }
         if (piececountopp[nextpieceopp] == 0) {
