@@ -1,4 +1,5 @@
 #include "consts.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
