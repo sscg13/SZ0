@@ -195,7 +195,7 @@ U64 Position::scratchzobrist() {
       scratch ^= hashes[piece % 8][i];
     }
   }
-  if (auxinfo & 1) {
+  if (stm) {
     scratch ^= colorhash;
   }
   return scratch;
@@ -209,8 +209,8 @@ void Position::initialize() {
   Bitboards[5] = (Rank1 | Rank8) & (FileB | FileG);
   Bitboards[6] = (Rank1 | Rank8) & (FileA | FileH);
   Bitboards[7] = (Rank1 | Rank8) & FileD;
-  auxinfo = 0;
-  history[0] = auxinfo;
+  stm = 0;
+  int startpiece[16] = {4, 3, 1, 5, 2, 1, 3, 4, 0, 0, 0, 0, 0, 0, 0, 0};
   for (int i = 0; i < 16; i++) {
     pieces[i] = 2 + startpiece[i];
     pieces[56 ^ i] = 10 + startpiece[i];
@@ -218,24 +218,8 @@ void Position::initialize() {
   for (int i = 16; i < 48; i++) {
     pieces[i] = 0;
   }
-  gamephase[0] = 24;
-  gamephase[1] = 24;
-  gamelength = 0;
-  zobrist[0] = zobristhash = scratchzobrist();
+  zobristhash = scratchzobrist();
 }
-int Position::repetitions() {
-  int repeats = 0;
-  for (int i = gamelength - 2; i >= 0; i -= 2) {
-    if (zobrist[i] == zobrist[gamelength]) {
-      repeats++;
-      if (i >= root) {
-        repeats++;
-      }
-    }
-  }
-  return repeats;
-}
-int Position::halfmovecount() { return (auxinfo >> 1); }
 bool Position::twokings() { return (Bitboards[0] | Bitboards[1]) == Bitboards[7]; }
 bool Position::bareking(int color) {
   return (Bitboards[color] & Bitboards[7]) == Bitboards[color];
@@ -261,22 +245,6 @@ U64 Position::checkers(int color) {
   attacks &= Bitboards[opposite];
   return attacks;
 }
-void Position::makenullmove() {
-  gamelength++;
-  int halfmove = (auxinfo >> 1) & 127;
-  zobristhash ^= colorhash;
-  auxinfo ^= (halfmove << 1);
-  halfmove++;
-  auxinfo ^= (halfmove << 1);
-  auxinfo ^= 1;
-  zobrist[gamelength] = zobristhash;
-  history[gamelength] = auxinfo;
-}
-void Position::unmakenullmove() {
-  gamelength--;
-  auxinfo = history[gamelength];
-  zobristhash = zobrist[gamelength];
-}
 U64 Position::keyafter(int notation) {
   int from = notation & 63;
   int to = (notation >> 6) & 63;
@@ -292,12 +260,11 @@ U64 Position::keyafter(int notation) {
   }
   return zobristhash ^ change;
 }
-void Position::makemove(int notation, bool reversible) {
+void Position::makemove(int notation) {
   // 6 bits from square, 6 bits to square, 1 bit color, 3 bits piece moved, 1
   // bit capture, 3 bits piece captured, 1 bit promotion, 21 bits total
 
   // 1 bit color, 7 bits halfmove
-  gamelength++;
   int from = notation & 63;
   int to = (notation >> 6) & 63;
   int color = (notation >> 12) & 1;
@@ -309,24 +276,15 @@ void Position::makemove(int notation, bool reversible) {
   zobristhash ^= (hashes[color][from] ^ hashes[color][to]);
   zobristhash ^= (hashes[piece][from] ^ hashes[piece][to]);
   int captured = (notation >> 17) & 7;
-  int halfmove = (auxinfo >> 1);
-  auxinfo ^= (halfmove << 1);
-  halfmove++;
-  auxinfo &= 0x0003C0FF;
+  halfmovecount++;
   if (piece == 2) {
-    halfmove = 0;
-    if (!reversible) {
-      gamelength = 0;
-    }
+    halfmovecount = 0;
   }
   if (notation & (1 << 16)) {
     Bitboards[color ^ 1] ^= (1ULL << to);
     Bitboards[captured] ^= (1ULL << to);
     zobristhash ^= (hashes[color ^ 1][to] ^ hashes[captured][to]);
-    halfmove = 0;
-    if (!reversible) {
-      gamelength = 0;
-    }
+    halfmovecount = 0;
   }
   if (notation & (1 << 20)) {
     Bitboards[2] ^= (1ULL << to);
@@ -334,20 +292,10 @@ void Position::makemove(int notation, bool reversible) {
     pieces[to] = 8 * color + 4;
     zobristhash ^= (hashes[2][to] ^ hashes[4][to]);
   }
-  if (!reversible) {
-    root = gamelength;
-  }
-  auxinfo ^= 1;
-  auxinfo ^= (halfmove << 1);
+  stm = !stm;
   zobristhash ^= colorhash;
-  history[gamelength] = auxinfo;
-  zobrist[gamelength] = zobristhash;
-  nodecount++;
 }
 void Position::unmakemove(int notation) {
-  gamelength--;
-  auxinfo = history[gamelength];
-  zobristhash = zobrist[gamelength];
   int from = notation & 63;
   int to = (notation >> 6) & 63;
   int color = (notation >> 12) & 1;
@@ -702,7 +650,7 @@ U64 Position::perft(int depth, int initialdepth, int color) {
   U64 ans = 0;
   if (depth > 1) {
     for (int i = 0; i < movcount; i++) {
-      makemove(moves[i], true);
+      makemove(moves[i]);
       if (depth == initialdepth) {
         std::cout << algebraic(moves[i]);
         std::cout << ": ";
@@ -750,15 +698,13 @@ U64 Position::perftnobulk(int depth, int initialdepth, int color) {
   return ans;
 }
 void Position::parseFEN(std::string FEN) {
-  gamelength = 0;
-  root = 0;
   int progress = 0;
   for (int i = 0; i < 8; i++) {
     Bitboards[i] = 0ULL;
   }
   int tracker = 0;
   int castling = 0;
-  int color = 0;
+  stm = 0;
   while (FEN[tracker] != ' ') {
     char hm = FEN[tracker];
     if ('0' <= hm && hm <= '9') {
@@ -830,19 +776,15 @@ void Position::parseFEN(std::string FEN) {
     tracker++;
   }
   if (FEN[tracker] == 'b') {
-    color = 1;
+    stm = 1;
   }
-  auxinfo = color;
   tracker += 6;
-  int halfmove = (int)(FEN[tracker]) - 48;
-  tracker++;
-  if (FEN[tracker] != ' ') {
-    halfmove = 10 * halfmove + (int)(FEN[tracker]) - 48;
+  halfmovecount = 0;
+  while (FEN[tracker] != ' ') {
+    halfmovecount = 10 * halfmovecount + (int)(FEN[tracker] - '0');
+    tracker++;
   }
-  auxinfo |= (halfmove << 1);
   zobristhash = scratchzobrist();
-  zobrist[0] = zobristhash;
-  history[0] = auxinfo;
 }
 std::string Position::getFEN() {
   std::string FEN = "";
@@ -881,12 +823,12 @@ std::string Position::getFEN() {
     }
   }
   FEN = FEN + ' ';
-  if (auxinfo & 1) {
+  if (stm) {
     FEN = FEN + "b - - ";
   } else {
     FEN = FEN + "w - - ";
   }
-  int halfmove = auxinfo >> 1;
+  int halfmove = halfmovecount;
   std::string bruh = "";
   do {
     bruh = bruh + (char)(halfmove % 10 + 48);
@@ -896,7 +838,7 @@ std::string Position::getFEN() {
   FEN = FEN + bruh + " 1";
   return FEN;
 }
-bool Position::see_exceeds(int mov, int color, int threshold) {
+bool Position::see_exceeds(int mov, int threshold) {
   int see_values[6] = {100, 100, 170, 370, 640, 20000};
   int target = (mov >> 6) & 63;
   int victim = (mov >> 17) & 7;
