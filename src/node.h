@@ -14,11 +14,12 @@ struct alignas(8) Node {
   std::atomic_flag is_expanding = ATOMIC_FLAG_INIT;
 
   Move move;
-  U16 num_children;
+  U8 num_children;
+  std::atomic<U8> virtual_visits;
 
   Node()
       : first_child_idx(0), visits(0), value_sum(0.0f), prior(0.0f),
-        move(Move()), num_children(0) {}
+        move(Move()), num_children(0), virtual_visits(0) {}
 };
 
 struct TreeArena {

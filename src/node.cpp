@@ -43,15 +43,17 @@ U32 select_best_puct(const TreeArena &arena, U32 node_idx) {
   U32 best_idx = parent.first_child_idx;
   float best_score = -std::numeric_limits<float>::infinity();
 
-  for (U16 i = 0; i < parent.num_children; ++i) {
+  for (U8 i = 0; i < parent.num_children; ++i) {
     U32 child_idx = parent.first_child_idx + i;
     const Node &child = arena.nodes[child_idx];
-
-    float q_value = (child.visits > 0)
-                        ? (-child.value_sum / static_cast<float>(child.visits))
+    int real_visits = child.visits.load(std::memory_order_relaxed);
+    int virtual_visits = child.virtual_visits.load(std::memory_order_relaxed);
+    int effective_visits = real_visits + virtual_visits;
+    float q_value = (real_visits > 0)
+                        ? (-child.value_sum / static_cast<float>(real_visits))
                         : 0.0f;
     float u_value =
-        c_puct * child.prior * (sqrt_parent_visits / (1.0f + child.visits));
+        c_puct * child.prior * (sqrt_parent_visits / (1.0f + effective_visits));
     float score = q_value + u_value;
 
     if (score > best_score) {
@@ -117,6 +119,8 @@ int mcts_rollout(TreeArena &arena, const Position &root_pos,
     current_idx = best_child_idx;
     search_path.push_back(current_idx);
     rollout_hashes.push_back(current_pos.zobristhash);
+    arena.nodes[current_idx].virtual_visits.fetch_add(
+        1, std::memory_order_relaxed);
     depth++;
   }
 
@@ -148,9 +152,20 @@ int mcts_rollout(TreeArena &arena, const Position &root_pos,
               movecount, std::memory_order_relaxed);
 
           if (child_start + movecount < arena.max_nodes) {
+            for (size_t i = 0; i < movecount; i++) {
+              size_t child_idx = child_start + i;
+              arena.nodes[child_idx].move = moves[i];
+              arena.nodes[child_idx].visits.store(0, std::memory_order_relaxed);
+              arena.nodes[child_idx].value_sum.store(0.0f,
+                                                     std::memory_order_relaxed);
+              arena.nodes[child_idx].first_child_idx = -1;
+              arena.nodes[child_idx].num_children = 0;
+              arena.nodes[child_idx].is_expanding.clear(
+                  std::memory_order_release);
+            }
+            std::atomic_thread_fence(std::memory_order_release);
             arena.nodes[current_idx].first_child_idx = child_start;
             arena.nodes[current_idx].num_children = movecount;
-
             float uniform_prior = 1.0f / movecount;
             for (int i = 0; i < movecount; ++i) {
               arena.nodes[child_start + i].move = moves[i];
@@ -171,6 +186,9 @@ int mcts_rollout(TreeArena &arena, const Position &root_pos,
   // BACKPROPAGATION
   for (int i = search_path.size() - 1; i >= 0; --i) {
     U32 idx = search_path[i];
+    if (i > 0) {
+      arena.nodes[idx].virtual_visits.fetch_sub(1, std::memory_order_relaxed);
+    }
     arena.nodes[idx].visits.fetch_add(1, std::memory_order_relaxed);
     arena.nodes[idx].value_sum.fetch_add(value, std::memory_order_relaxed);
     value = -value;

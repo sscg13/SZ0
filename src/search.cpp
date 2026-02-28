@@ -81,6 +81,9 @@ void search_position(TreeArena &arena, const Position &current_pos,
                      int threadcount) {
   stop_search.store(false, std::memory_order_relaxed);
   total_rollouts.store(0, std::memory_order_relaxed);
+  seldepth.store(0, std::memory_order_relaxed);
+  depthsum.store(0, std::memory_order_relaxed);
+  arena.clear();
 
   auto start = std::chrono::steady_clock::now();
   auto last_info = start;
