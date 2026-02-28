@@ -1,3 +1,4 @@
+#include "datagen.h"
 #include "node.h"
 #include "position.h"
 #include "search.h"
@@ -7,6 +8,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 // clang-format off
@@ -23,7 +25,7 @@ void uci() {
   std::string ucicommand;
   Position current_pos;
   current_pos.initialize();
-  TreeArena arena(3145728);
+  TreeArena arena(defaultarenasize);
   std::vector<U64> game_hashes;
   int threadcount = 1;
 
@@ -82,7 +84,7 @@ void uci() {
       int winc = 0;
       int binc = 0;
       int movetime = 0;
-      int nodecount = 0;
+      U64 nodecount = 0;
       while (tokens >> token) {
         if (token == "wtime") {
           tokens >> token;
@@ -117,7 +119,7 @@ void uci() {
         }
       }
       arena.clear();
-      search_position(arena, current_pos, game_hashes, movetime, threadcount);
+      search_position(arena, current_pos, game_hashes, movetime, nodecount, threadcount, true);
     }
     if (token == "setoption") {
       tokens >> token;
@@ -136,12 +138,40 @@ void uci() {
   }
 }
 
-int main() {
+int main(int argc, char* argv[]) {
   initializeleaperattacks();
   initializemasks();
   initializerankattacks();
   initializezobrist();
   setvbuf(stdout, NULL, _IONBF, 0);
-  uci();
+  if (argc > 1 && std::string(argv[1]) == "datagen") {
+    if (argc != 6) {
+      std::cerr << "Proper usage: ./(exe) datagen <game_count> <threads> <nodes> <output_file>\n";
+      return 0;
+    }
+    int num_games = atoi(argv[2]);
+    int num_threads = atoi(argv[3]);
+    int node_limit = atoi(argv[4]);
+    std::string outputfile(argv[5]);
+
+    std::cout << "Starting Data Generation Engine...\n";
+    std::cout << "Threads: " << num_threads << "\n";
+    std::cout << "Nodes/Move: " << node_limit << "\n";
+    std::cout << "Data Output: " << outputfile << "X.data\n";
+
+    std::vector<std::thread> workers;
+    for (int i = 0; i < num_threads; ++i) {
+        workers.emplace_back(datagen_worker, i, node_limit, num_games, outputfile);
+    }
+
+    for (auto& t : workers) {
+        t.join();
+    }
+
+    return 0;
+  }
+  else {
+    uci();
+  }
   return 0;
 }

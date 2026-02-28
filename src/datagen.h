@@ -11,3 +11,6 @@ struct TrainingPosition {
     U8 halfmove_clock;
     I8 outcome;
 };
+
+int generate_mcts_selfplay_game(const std::string& output_filename, U64 nodecount);
+void datagen_worker(int thread_id, int node_limit, int game_count, const std::string& base_filename);

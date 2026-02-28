@@ -78,7 +78,7 @@ Move get_best_move(TreeArena &arena) {
 
 void search_position(TreeArena &arena, const Position &current_pos,
                      const std::vector<uint64_t> &game_hashes, int timelimit,
-                     int threadcount) {
+                     U64 nodelimit, int threadcount, bool print_info) {
   stop_search.store(false, std::memory_order_relaxed);
   total_rollouts.store(0, std::memory_order_relaxed);
   seldepth.store(0, std::memory_order_relaxed);
@@ -99,7 +99,13 @@ void search_position(TreeArena &arena, const Position &current_pos,
     auto elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
             .count();
-    if (elapsed >= timelimit) {
+    if (elapsed >= timelimit && timelimit > 0) {
+      stop_search.store(true, std::memory_order_relaxed);
+      break;
+    }
+
+    U64 current_nodes = total_rollouts.load(std::memory_order_relaxed);
+    if (current_nodes >= nodelimit && nodelimit > 0) {
       stop_search.store(true, std::memory_order_relaxed);
       break;
     }
@@ -107,9 +113,7 @@ void search_position(TreeArena &arena, const Position &current_pos,
     auto time_since_info =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_info)
             .count();
-    if (time_since_info >= 400) {
-      uint64_t current_nodes = total_rollouts.load(std::memory_order_relaxed);
-      uint64_t nps = (elapsed > 0) ? (current_nodes * 1000ULL) / elapsed : 0;
+    if (time_since_info >= 400 && print_info) {
 
       printinfostring(arena, elapsed,
                       depthsum.load(std::memory_order_relaxed) /
@@ -129,10 +133,12 @@ void search_position(TreeArena &arena, const Position &current_pos,
   auto elapsed =
       std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
           .count();
+  if (print_info) {
   printinfostring(arena, elapsed,
                   depthsum.load(std::memory_order_relaxed) /
                       total_rollouts.load(std::memory_order_relaxed),
                   seldepth.load(std::memory_order_relaxed));
+  }
   Move best = get_best_move(arena);
   if (best == Move()) {
     Move moves[maxmoves];
@@ -140,5 +146,7 @@ void search_position(TreeArena &arena, const Position &current_pos,
     copy_pos.generatemoves(moves);
     best = moves[0];
   }
-  std::cout << "bestmove " << algebraic(best) << "\n";
+  if (print_info) {
+    std::cout << "bestmove " << algebraic(best) << "\n";
+  }
 }

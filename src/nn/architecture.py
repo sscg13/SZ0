@@ -31,16 +31,20 @@ class ShatranjNet(nn.Module):
     num_heads: int = 8
     d_ff: int = 1024
     vocab_size: int = 13 
-    max_halfmoves: int = 139 
+    max_halfmoves: int = 140
 
     @nn.compact
     def __call__(self, board_tokens, halfmove_token):
-        # Embeddings & Setup
-        x = nn.Embed(num_embeddings=self.vocab_size, features=self.d_model)(board_tokens) 
+        # Guard just in case
+        safe_board_tokens = jnp.clip(board_tokens, 0, self.vocab_size - 1)
+        safe_halfmove_token = jnp.clip(halfmove_token, 0, self.max_halfmoves - 1)
+
+        # Embeddings & Setup (using the safe tokens)
+        x = nn.Embed(num_embeddings=self.vocab_size, features=self.d_model)(safe_board_tokens) 
         pos_emb = self.param('pos_emb', nn.initializers.normal(stddev=0.02), (64, self.d_model))
         x = x + pos_emb
 
-        g_emb = nn.Embed(num_embeddings=self.max_halfmoves, features=self.d_model)(halfmove_token) 
+        g_emb = nn.Embed(num_embeddings=self.max_halfmoves, features=self.d_model)(safe_halfmove_token) 
         x = x + jnp.expand_dims(g_emb, axis=-2) 
 
         # Transformer Body
@@ -58,7 +62,7 @@ class ShatranjNet(nn.Module):
         # The Policy Head (Dot-Product)
         p_from = nn.Dense(64)(x) 
         p_to = nn.Dense(64)(x)   
-        policy_logits = jnp.einsum('bid,bjd->bij', p_from, p_to) 
+        policy_logits = jnp.einsum('bid,bjd->bij', p_from, p_to) / 8.0
 
         return policy_logits, value_logits
 

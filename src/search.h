@@ -4,4 +4,4 @@
 
 void search_position(TreeArena &arena, const Position &current_pos,
                      const std::vector<uint64_t> &game_hashes, int timelimit,
-                     int threadcount);
+                     U64 nodelimit, int threadcount, bool print_info);

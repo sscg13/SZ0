@@ -27,7 +27,7 @@ struct TreeArena {
   std::atomic<size_t> active_nodes;
   size_t max_nodes;
 
-  TreeArena(size_t initial_capacity = 3145728) {
+  TreeArena(size_t initial_capacity) {
     nodes = std::make_unique<Node[]>(initial_capacity);
     active_nodes.store(0, std::memory_order_relaxed);
     max_nodes = initial_capacity;

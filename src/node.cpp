@@ -175,11 +175,11 @@ int mcts_rollout(TreeArena &arena, const Position &root_pos,
           }
 
           // Get the dummy evaluation (soon to be neural network)
-          value = materialist(current_pos);
+          value = dummy_evaluate(current_pos);
         }
       }
     } else {
-      value = materialist(current_pos);
+      value = dummy_evaluate(current_pos);
     }
   }
 
