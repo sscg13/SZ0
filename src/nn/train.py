@@ -101,11 +101,11 @@ def train():
     print("Starting Training Loop...\n")
     
     # Load files
-    data_files = ["small.data"]
+    data_files = ["run0.data", "run1.data", "run2.data", "run3.data"]
     full_dataset = load_sparse_dataset(data_files)
-    dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=512)
+    dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=128)
     
-    epochs = 5
+    epochs = 10
     step = 0
     start_time = time.time()
     
@@ -121,11 +121,12 @@ def train():
 
             step += 1
             
-            elapsed = time.time() - start_time
-            print(f"Step {step:04d} | Total: {loss:.4f} "
-                  f"[Pol: {p_loss:.4f} | Val: {v_loss:.4f} (WDL: {wdl_loss:.4f}, Q: {q_loss:.4f})] "
-                  f"| Time: {elapsed:.2f}s")
-            start_time = time.time()
+            if step % 100 == 0:
+                elapsed = time.time() - start_time
+                print(f"Step {step:04d} | Total: {loss:.4f} "
+                      f"[Pol: {p_loss:.4f} | Val: {v_loss:.4f} (WDL: {wdl_loss:.4f}, Q: {q_loss:.4f})] "
+                      f"| Time: {elapsed:.2f}s")
+                start_time = time.time()
 
         print(f"Saving checkpoint for epoch {epoch}...")
         checkpoint_manager.save(
@@ -141,7 +142,7 @@ def train():
     return state
 
 # Create an absolute path for your checkpoints
-ckpt_dir = os.path.abspath("./alpha_weights")
+ckpt_dir = os.path.abspath("./sz0_weights")
 # Configure the manager (e.g., only keep the 5 most recent checkpoints)
 options = ocp.CheckpointManagerOptions(max_to_keep=5, create=True)
 # Initialize the manager using the modern API
