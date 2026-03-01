@@ -59,4 +59,5 @@ public:
   }
 
   NNOutput infer(const Position &pos);
+  std::vector<NNOutput> infer_batch(const std::vector<Position> &positions);
 };

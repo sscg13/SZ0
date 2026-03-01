@@ -57,6 +57,10 @@ void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
                  std::vector<uint64_t> game_history) {
   while (!stop_search.load(std::memory_order_relaxed)) {
     int depth = mcts_rollout(nn, arena, root_pos, game_history);
+    if (depth == 0) {
+      std::this_thread::yield();
+      continue;
+    }
     total_rollouts.fetch_add(1, std::memory_order_relaxed);
     if (arena.active_nodes.load(std::memory_order_relaxed) >=
         arena.max_nodes - 256) {
@@ -121,7 +125,7 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
     auto time_since_info =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_info)
             .count();
-    if (time_since_info >= 400 && print_info) {
+    if (time_since_info >= 400 && print_info && current_nodes > 0) {
 
       printinfostring(arena, elapsed,
                       depthsum.load(std::memory_order_relaxed) /

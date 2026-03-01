@@ -117,7 +117,7 @@ void uci() {
         int ourtime = current_pos.stm ? btime : wtime;
         int ourinc = current_pos.stm ? binc : winc;
         if (ourtime > 0) {
-          movetime = (ourtime + 9 * ourinc) / 10;
+          movetime = (ourtime + 7 * ourinc) / 10;
         }
       }
       arena.clear();
