@@ -1,9 +1,11 @@
+#include "inference.h"
 #include "position.h"
 
 #include <atomic>
 #include <memory>
 #include <random>
 #include <vector>
+
 #pragma once
 
 struct alignas(8) Node {
@@ -39,5 +41,5 @@ struct TreeArena {
 
 float dummy_evaluate(const Position &pos);
 U32 select_best_puct(const TreeArena &arena, U32 node_idx);
-int mcts_rollout(TreeArena &arena, const Position &root_pos,
+int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
                  const std::vector<U64> &game_hashes);

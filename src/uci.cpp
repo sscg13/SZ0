@@ -1,4 +1,5 @@
 #include "datagen.h"
+#include "inference.h"
 #include "node.h"
 #include "position.h"
 #include "search.h"
@@ -27,6 +28,7 @@ void uci() {
   current_pos.initialize();
   TreeArena arena(defaultarenasize);
   std::vector<U64> game_hashes;
+  NNEvaluator nn("sz0_epoch9.onnx");
   int threadcount = 1;
 
   while (std::getline(std::cin, ucicommand)) {
@@ -119,7 +121,8 @@ void uci() {
         }
       }
       arena.clear();
-      search_position(arena, current_pos, game_hashes, movetime, nodecount, threadcount, true);
+      search_position(nn, arena, current_pos, game_hashes, movetime, nodecount,
+                      threadcount, true);
     }
     if (token == "setoption") {
       tokens >> token;
@@ -138,7 +141,7 @@ void uci() {
   }
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char *argv[]) {
   initializeleaperattacks();
   initializemasks();
   initializerankattacks();
@@ -146,7 +149,8 @@ int main(int argc, char* argv[]) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc > 1 && std::string(argv[1]) == "datagen") {
     if (argc != 6) {
-      std::cerr << "Proper usage: ./(exe) datagen <game_count> <threads> <nodes> <output_file>\n";
+      std::cerr << "Proper usage: ./(exe) datagen <game_count> <threads> "
+                   "<nodes> <output_file>\n";
       return 0;
     }
     int num_games = atoi(argv[2]);
@@ -159,18 +163,19 @@ int main(int argc, char* argv[]) {
     std::cout << "Nodes/Move: " << node_limit << "\n";
     std::cout << "Data Output: " << outputfile << "X.data\n";
 
+    NNEvaluator nn("sz0_epoch9.onnx");
     std::vector<std::thread> workers;
     for (int i = 0; i < num_threads; ++i) {
-        workers.emplace_back(datagen_worker, i, node_limit, num_games, outputfile);
+      workers.emplace_back(datagen_worker, i, node_limit, num_games, outputfile,
+                           std::ref(nn));
     }
 
-    for (auto& t : workers) {
-        t.join();
+    for (auto &t : workers) {
+      t.join();
     }
 
     return 0;
-  }
-  else {
+  } else {
     uci();
   }
   return 0;

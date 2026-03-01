@@ -19,6 +19,11 @@ ifeq ($(CXX), g++)
 	CC := gcc
 endif
 
+ONNX_DIR := src/onnx/win
+INCLUDES := -I$(ONNX_DIR)/include
+LDFLAGS  := -L$(ONNX_DIR)/lib
+LDLIBS   := -lonnxruntime
+
 ifeq ($(DEBUG), no)
 	CXXFLAGS := -O3 -march=$(ARCH) -mtune=$(TUNE) -std=c++23 
 	CFLAGS := -O3 -march=$(ARCH) -mtune=$(TUNE)
@@ -27,7 +32,6 @@ else
 	CFLAGS := -g -march=$(ARCH) -mtune=$(TUNE)
 endif
 
-LDFLAGS :=
 SUFFIX :=
 
 ifeq ($(OS), Windows_NT)
@@ -37,14 +41,14 @@ endif
 OUT := $(EXE)$(SUFFIX)
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(EXE): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $(OUT) $^
-	@echo "Build complete. Run with ./$(EXE)"
+	$(CXX) $(CXXFLAGS) -o $(OUT) $^ $(LDFLAGS) $(LDLIBS)
+	@echo "Build complete. Run with ./$(OUT)"
 
 clean:
 	rm -f $(OBJS)
