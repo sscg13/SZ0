@@ -22,13 +22,6 @@ void TreeArena::resize(int megabytes) {
   max_nodes = new_max_nodes;
 }
 
-float dummy_evaluate(const Position &pos) {
-  thread_local std::mt19937 rng(std::random_device{}());
-  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
-  return dist(rng);
-}
-
 U32 select_best_puct(const TreeArena &arena, U32 node_idx) {
   const Node &parent = arena.nodes[node_idx];
   const float c_puct = 2.0f;

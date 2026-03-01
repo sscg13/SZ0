@@ -149,30 +149,22 @@ int main(int argc, char *argv[]) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc > 1 && std::string(argv[1]) == "datagen") {
     if (argc != 6) {
-      std::cerr << "Proper usage: ./(exe) datagen <game_count> <threads> "
+      std::cerr << "Proper usage: ./(exe) datagen <game_count> <concurrency> "
                    "<nodes> <output_file>\n";
       return 0;
     }
     int num_games = atoi(argv[2]);
-    int num_threads = atoi(argv[3]);
+    int concurrency = atoi(argv[3]);
     int node_limit = atoi(argv[4]);
     std::string outputfile(argv[5]);
 
     std::cout << "Starting Data Generation Engine...\n";
-    std::cout << "Threads: " << num_threads << "\n";
+    std::cout << "Concurrency: " << concurrency << "\n";
     std::cout << "Nodes/Move: " << node_limit << "\n";
-    std::cout << "Data Output: " << outputfile << "X.data\n";
+    std::cout << "Data Output: " << outputfile << ".data\n";
 
     NNEvaluator nn("sz0_epoch9.onnx");
-    std::vector<std::thread> workers;
-    for (int i = 0; i < num_threads; ++i) {
-      workers.emplace_back(datagen_worker, i, node_limit, num_games, outputfile,
-                           std::ref(nn));
-    }
-
-    for (auto &t : workers) {
-      t.join();
-    }
+    generate_batched_selfplay_games(nn, outputfile, node_limit, concurrency, num_games);
 
     return 0;
   } else {

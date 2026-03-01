@@ -87,4 +87,4 @@ def inspect_data(filename, num_positions=3):
         print(f"Error: Could not find {filename}")
 
 if __name__ == "__main__":
-    inspect_data("run2.data", 300)
+    inspect_data("test.data", 300)

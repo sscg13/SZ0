@@ -42,10 +42,22 @@ public:
 
     // TODO: CUDA
     /*
-    OrtCUDAProviderOptions cuda_options;
-    cuda_options.device_id = 0;
-    session_options.AppendExecutionProvider_CUDA(cuda_options);
-    */
+    try {
+        OrtCUDAProviderOptionsV2* cuda_options = nullptr;
+        Ort::GetApi().CreateCUDAProviderOptions(&cuda_options);
+
+        // Optional: Set specific GPU options (Device 0, use Arena, etc.)
+        std::vector<const char*> keys = {"device_id", "arena_extend_strategy"};
+        std::vector<const char*> values = {"0", "kSameAsRequested"};
+        Ort::GetApi().UpdateCUDAProviderOptions(cuda_options, keys.data(), values.data(), keys.size());
+
+        session_options.AppendExecutionProvider_CUDA_V2(cuda_options);
+        
+        // Always release the options pointer after appending
+        Ort::GetApi().ReleaseCUDAProviderOptions(cuda_options);
+    } catch (const Ort::Exception& e) {
+        fprintf(stderr, "Warning: CUDA not available, falling back to CPU. Error: %s\n", e.what());
+    }*/
 
 #ifdef _WIN32
     // Windows requires wide strings (wchar_t) for paths

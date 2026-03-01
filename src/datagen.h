@@ -1,4 +1,5 @@
 #include "inference.h"
+#include "node.h"
 #include "position.h"
 
 #pragma once
@@ -13,8 +14,28 @@ struct TrainingPosition {
   I8 outcome;
 };
 
-int generate_mcts_selfplay_game(NNEvaluator &nn,
-                                const std::string &output_filename,
-                                U64 nodecount);
-void datagen_worker(int thread_id, int node_limit, int game_count,
-                    const std::string &base_filename, NNEvaluator &nn);
+struct DatagenGame {
+  Position root_pos;
+  TreeArena arena;
+  std::vector<U64> game_hashes;
+  
+  // MCTS Step State
+  Position leaf_pos; 
+  std::vector<U32> search_path;
+  int rollouts_completed = 0;
+
+  // Datagen History
+  std::vector<TrainingPosition> game_history;
+  int ply_count = 0;
+  bool is_active = true;
+
+  DatagenGame(size_t arena_size) : arena(arena_size) {
+      root_pos.initialize();
+  }
+};
+
+void generate_batched_selfplay_games(NNEvaluator &nn, 
+                                     const std::string &output_prefix, 
+                                     U64 nodecount, 
+                                     int concurrent_games, 
+                                     int total_games_to_play);
