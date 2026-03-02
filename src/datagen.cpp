@@ -352,7 +352,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
               int to_sq = g.root_pos.stm ? (m.to() ^ 56) : m.to();
 
               train_pos.move_indices[c] = (from_sq * 64) + to_sq;
-              float visit_prob = child.visits / total_child_visits;
+              float visit_prob = static_cast<float>(child.visits.load(std::memory_order_relaxed)) / total_child_visits;
               train_pos.move_probabilities[c] = visit_prob;
 
               cumulative_prob += visit_prob;
