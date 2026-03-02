@@ -121,3 +121,40 @@ NNOutput NNEvaluator::infer(const Position &pos) {
   
   return batched_results[0]; // Return the first (and only) result
 }
+
+void NNEvaluator::infer_packed(const std::vector<int32_t>& flat_pieces, 
+                                const std::vector<int32_t>& flat_halfmoves,
+                                std::vector<NNOutput>& shared_results,
+                                const std::vector<int>& batch_to_game_idx) {
+  std::array<int64_t, 2> board_shape{datagenbatchsize, 64};
+  std::array<int64_t, 1> halfmove_shape{datagenbatchsize};
+
+  // Wrap the exact memory the threads just packed (zero-copy)
+  Ort::Value board_tensor = Ort::Value::CreateTensor<int32_t>(
+      memory_info, const_cast<int32_t*>(flat_pieces.data()), flat_pieces.size(),
+      board_shape.data(), board_shape.size());
+
+  Ort::Value halfmove_tensor = Ort::Value::CreateTensor<int32_t>(
+      memory_info, const_cast<int32_t*>(flat_halfmoves.data()), flat_halfmoves.size(),
+      halfmove_shape.data(), halfmove_shape.size());
+
+  std::vector<Ort::Value> input_tensors;
+  input_tensors.push_back(std::move(board_tensor));
+  input_tensors.push_back(std::move(halfmove_tensor));
+
+  // Run DMA Inference
+  auto output_tensors = session.Run(
+      Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(),
+      input_tensors.size(), output_names.data(), output_names.size());
+
+  // Slice Outputs
+  std::vector<NNOutput> results(datagenbatchsize);
+  float *policy_ptr = output_tensors[0].GetTensorMutableData<float>();
+  float *value_ptr = output_tensors[1].GetTensorMutableData<float>();
+
+  for (int b = 0; b < datagenbatchsize; ++b) {
+        int target_game = batch_to_game_idx[b];
+        std::copy(policy_ptr + (b * 4096), policy_ptr + ((b + 1) * 4096), shared_results[target_game].policy);
+        std::copy(value_ptr + (b * 3), value_ptr + ((b + 1) * 3), shared_results[target_game].value);
+    }
+}

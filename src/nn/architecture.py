@@ -7,7 +7,7 @@ import flax.linen as nn
 class ShatranjBlock(nn.Module):
     d_model: int = 256
     num_heads: int = 8
-    d_ff: int = 1024
+    d_ff: int = 256
 
     @nn.compact
     def __call__(self, x):
@@ -29,7 +29,7 @@ class ShatranjNet(nn.Module):
     num_layers: int = 6
     d_model: int = 256
     num_heads: int = 8
-    d_ff: int = 1024
+    d_ff: int = 256
     vocab_size: int = 13 
     max_halfmoves: int = 140
 

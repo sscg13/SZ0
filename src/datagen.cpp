@@ -2,7 +2,9 @@
 #include "node.h"
 #include "search.h"
 
+#include <barrier>
 #include <fstream>
+#include <thread>
 
 void save_game_to_binary(const std::vector<TrainingPosition> &game_history,
                          std::ofstream &out) {
@@ -161,8 +163,7 @@ void expand(DatagenGame &game, const NNOutput &raw_nn) {
 
 void generate_batched_selfplay_games(NNEvaluator &nn, 
                                      const std::string &output_prefix, 
-                                     U64 nodecount, 
-                                     int concurrent_games, 
+                                     U64 nodecount,
                                      int total_games_to_play) {
   std::string filename = output_prefix + ".data";
   std::ofstream out(filename, std::ios::binary | std::ios::app);
@@ -170,140 +171,234 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
     std::cerr << "Failed to open output file!" << std::endl;
     return;
   }
+  
+  auto begin = std::chrono::high_resolution_clock::now();
+  auto last_print = begin;
+  int total_nodes_evaluated = 0;
+  bool flush_onnx_output = false;
 
   std::vector<std::unique_ptr<DatagenGame>> games;
-  games.reserve(concurrent_games);
-  for (int i = 0; i < concurrent_games; ++i) {
+  games.reserve(datagenbatchsize);
+  for (int i = 0; i < datagenbatchsize; ++i) {
     games.push_back(std::make_unique<DatagenGame>(datagenarenasize));
   }
 
-  std::mt19937 rng(std::random_device{}());
-  std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
-  int games_completed = 0;
-  int positions_written = 0;
+  // --- Multi-threading Setup ---
+  std::mutex file_mutex; // Protects file writes and console output
+  std::atomic<int> games_completed{0};
+  std::atomic<int> positions_written{0};
+  std::atomic<bool> keep_running{true};
 
-  while (games_completed < total_games_to_play) {
-    std::vector<Position> batch_positions;
-    std::vector<int> batch_indices; 
 
-    for (int i = 0; i < concurrent_games; ++i) {
-      DatagenGame &g = *games[i];
-      if (!g.is_active) {
-        continue;
-      }
+  std::vector<bool> shared_needs_nn(datagenbatchsize, false);
+  std::vector<NNOutput> shared_nn_results(datagenbatchsize);
 
-      if (g.rollouts_completed < nodecount) {
-        bool needs_nn = select(g);
-        if (needs_nn) {
-          batch_positions.push_back(g.leaf_pos);
-          batch_indices.push_back(i);
-        }
-      }
-    }
+  // Pre-allocated flat arrays for the GPU batch
+  std::vector<int32_t> batched_pieces(datagenbatchsize * 64);
+  std::vector<int32_t> batched_halfmoves(datagenbatchsize);
+  
+  // Maps the dense GPU batch index (0 to current_batch_size) back to the global game index (0 to datagenbatchsize)
+  std::vector<int> batch_to_game_idx(datagenbatchsize);
+  std::atomic<int> current_batch_size{0};
 
-    // Batch GPU inference
-    if (!batch_positions.empty()) {
-      std::vector<NNOutput> results = nn.infer_batch(batch_positions);
-      for (size_t b = 0; b < results.size(); ++b) {
-        expand(*games[batch_indices[b]], results[b]);
-      }
-    }
+  std::barrier sync_point(datagenthreads);
 
-    // Backpropagate
-    for (int i = 0; i < concurrent_games; ++i) {
-      DatagenGame &g = *games[i];
-      if (!g.is_active || g.rollouts_completed < nodecount) {
-        continue;
-      }
+  auto worker = [&](int thread_idx) {
+    int chunk_size = datagenbatchsize / datagenthreads;
+    int start_idx = thread_idx * chunk_size;
+    int end_idx = (thread_idx == datagenthreads - 1) ? datagenbatchsize : start_idx + chunk_size;
 
-      Node &root = g.arena.nodes[0];
-      int game_result = 0; // 0: Draw, 1: White Wins, -1: Black Wins
-      bool is_terminal = false;
+    // VERY IMPORTANT: RNG must be thread-local to prevent massive lock contention/segfaults
+    std::mt19937 rng(std::random_device{}() + thread_idx); 
+    std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
 
-      if (root.num_children == 0) {
-        game_result = g.root_pos.stm ? 1 : -1;
-        is_terminal = true;
-      } else {
-        float total_child_visits = 0.0f;
-        for (int c = 0; c < root.num_children; ++c) {
-          total_child_visits += g.arena.nodes[root.first_child_idx + c].visits.load(std::memory_order_relaxed);
-        }
-        if (total_child_visits == 0.0f) total_child_visits = 1.0f;
+    while (keep_running.load(std::memory_order_relaxed)) {
+      
+      // ==========================================
+      // PHASE 1: MCTS Select (Parallelized)
+      // ==========================================
+      for (int i = start_idx; i < end_idx; ++i) {
+        shared_needs_nn[i] = false;
+        DatagenGame &g = *games[i];
+        if (!g.is_active) continue;
 
-        TrainingPosition train_pos;
-        train_pos.halfmove_clock = g.root_pos.halfmovecount;
-        get_canonical_tokens(g.root_pos, train_pos.board_tokens);
-        train_pos.num_moves = root.num_children;
-        train_pos.root_q = root.value_sum / std::max(1, root.visits.load(std::memory_order_relaxed));
+        if (g.rollouts_completed < nodecount) {
+          bool needs_nn = select(g);
+          if (needs_nn) {
+            shared_needs_nn[i] = true;
+            
+            // Lock-free atomic reservation for this board's slot in the batch
+            int b_idx = current_batch_size.fetch_add(1, std::memory_order_relaxed);
+            batch_to_game_idx[b_idx] = i;
 
-        float random_choice = prob_dist(rng);
-        float cumulative_prob = 0.0f;
-        Move selected_move = g.arena.nodes[root.first_child_idx].move;
-
-        for (int c = 0; c < root.num_children; ++c) {
-          Node &child = g.arena.nodes[root.first_child_idx + c];
-          Move m = child.move;
-          
-          int from_sq = g.root_pos.stm ? (m.from() ^ 56) : m.from();
-          int to_sq = g.root_pos.stm ? (m.to() ^ 56) : m.to();
-
-          train_pos.move_indices[c] = (from_sq * 64) + to_sq;
-          float visit_prob = child.visits / total_child_visits;
-          train_pos.move_probabilities[c] = visit_prob;
-
-          cumulative_prob += visit_prob;
-          if (random_choice <= cumulative_prob && random_choice != -1.0f) {
-            selected_move = m;
-            random_choice = -1.0f;
+            // Thread computes perspective flips directly into the shared GPU buffer!
+            for (int sq = 0; sq < 64; ++sq) {
+              int p_sq = g.leaf_pos.stm ? (sq ^ 56) : sq;
+              batched_pieces[(b_idx * 64) + p_sq] = perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm);
+            }
+            batched_halfmoves[b_idx] = g.leaf_pos.halfmovecount;
           }
         }
-
-        g.game_history.push_back(train_pos);
-        g.game_hashes.push_back(g.root_pos.zobristhash);
-        g.root_pos.makemove(selected_move);
-        g.ply_count++;
-
-        if (g.root_pos.twokings()) { game_result = 0; is_terminal = true; }
-        else if (g.root_pos.bareking(!g.root_pos.stm)) { game_result = g.root_pos.stm ? -1 : 1; is_terminal = true; }
-        else if (g.root_pos.halfmovecount >= 140) { game_result = 0; is_terminal = true; }
-        else if (is_repetition(g.root_pos, g.game_hashes)) { game_result = 0; is_terminal = true; }
       }
 
-      if (is_terminal) {
-        for (int p = 0; p < g.ply_count; ++p) {
-          if (game_result == 0) {
-            g.game_history[p].outcome = 0;
-          } else {
-            bool is_white_turn = (p % 2 == 0);
-            g.game_history[p].outcome = (game_result == 1) ? (is_white_turn ? 1 : -1) : (is_white_turn ? -1 : 1);
-          }
-        }
+      sync_point.arrive_and_wait(); // Wait for all threads to finish traversing
+      if (!keep_running.load(std::memory_order_relaxed)) break;
 
+      // ==========================================
+      // PHASE 2: GPU Inference (Thread 0 Only)
+      // ==========================================
+      if (thread_idx == 0) {
+        int batch_size = current_batch_size.load(std::memory_order_relaxed);
+        total_nodes_evaluated += batch_size;
         
-        save_game_to_binary(g.game_history, out);
-        games_completed++;
-        positions_written += g.game_history.size();
-
-        if (games_completed % 10 == 0) {
-            std::cout << "Games completed: " << games_completed << " / " << total_games_to_play 
-                      << " (Positions written: " << positions_written << ")\r" << std::flush;
+        if (batch_size > 0) {
+          // Hand the pre-packed flat arrays directly to ONNX
+          nn.infer_packed(batched_pieces, batched_halfmoves, shared_nn_results, batch_to_game_idx);
         }
 
-        if (games_completed + concurrent_games <= total_games_to_play) {
-           g.root_pos.initialize();
-           g.game_history.clear();
-           g.game_hashes.clear();
-           g.ply_count = 0;
-        } else {
-           g.is_active = false;
+        // Reset the atomic batch size for the next MCTS loop
+        current_batch_size.store(0, std::memory_order_relaxed);
+
+        if (games_completed.load(std::memory_order_relaxed) >= total_games_to_play) {
+          keep_running.store(false, std::memory_order_relaxed);
+        }
+        auto now = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_print).count();
+        int nps = 1000 * total_nodes_evaluated / std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
+        if (duration >= 1000) { // Print every 1 second
+            std::cout << "TRUE NPS: " << nps << "\r" << std::flush;
+            last_print = now;
+            /*if (!flush_onnx_output) {
+                Ort::AllocatorWithDefaultOptions allocator;
+                // This forces the RAM buffer to flush to the JSON file
+                auto profile_file = nn.session.EndProfilingAllocated(allocator);
+                flush_onnx_output = true;
+            }*/
         }
       }
 
-      if (g.root_pos.halfmovecount == 0 && !is_terminal) {
-        g.game_hashes.clear();
+      sync_point.arrive_and_wait();
+      if (!keep_running.load(std::memory_order_relaxed)) break;
+
+      // ==========================================
+      // PHASE 3: Expand & Move Check (Parallelized)
+      // ==========================================
+      for (int i = start_idx; i < end_idx; ++i) {
+        DatagenGame &g = *games[i];
+        if (!g.is_active) continue;
+
+        if (shared_needs_nn[i] && g.rollouts_completed < nodecount) {
+          expand(g, shared_nn_results[i]);
+        }
+
+        if (g.rollouts_completed >= nodecount) {
+          Node &root = g.arena.nodes[0];
+          int game_result = 0; 
+          bool is_terminal = false;
+
+          if (root.num_children == 0) {
+            game_result = g.root_pos.stm ? 1 : -1;
+            is_terminal = true;
+          } else {
+            float total_child_visits = 0.0f;
+            for (int c = 0; c < root.num_children; ++c) {
+              total_child_visits += g.arena.nodes[root.first_child_idx + c].visits.load(std::memory_order_relaxed);
+            }
+            if (total_child_visits == 0.0f) total_child_visits = 1.0f;
+
+            TrainingPosition train_pos;
+            train_pos.halfmove_clock = g.root_pos.halfmovecount;
+            get_canonical_tokens(g.root_pos, train_pos.board_tokens);
+            train_pos.num_moves = root.num_children;
+            train_pos.root_q = root.value_sum / std::max(1, root.visits.load(std::memory_order_relaxed));
+
+            float random_choice = prob_dist(rng);
+            float cumulative_prob = 0.0f;
+            Move selected_move = g.arena.nodes[root.first_child_idx].move;
+
+            for (int c = 0; c < root.num_children; ++c) {
+              Node &child = g.arena.nodes[root.first_child_idx + c];
+              Move m = child.move;
+              
+              int from_sq = g.root_pos.stm ? (m.from() ^ 56) : m.from();
+              int to_sq = g.root_pos.stm ? (m.to() ^ 56) : m.to();
+
+              train_pos.move_indices[c] = (from_sq * 64) + to_sq;
+              float visit_prob = child.visits / total_child_visits;
+              train_pos.move_probabilities[c] = visit_prob;
+
+              cumulative_prob += visit_prob;
+              if (random_choice <= cumulative_prob && random_choice != -1.0f) {
+                selected_move = m;
+                random_choice = -1.0f;
+              }
+            }
+
+            g.game_history.push_back(train_pos);
+            g.game_hashes.push_back(g.root_pos.zobristhash);
+            g.root_pos.makemove(selected_move);
+            g.ply_count++;
+
+            if (g.root_pos.twokings()) { game_result = 0; is_terminal = true; }
+            else if (g.root_pos.bareking(!g.root_pos.stm)) { game_result = g.root_pos.stm ? -1 : 1; is_terminal = true; }
+            else if (g.root_pos.halfmovecount >= 140) { game_result = 0; is_terminal = true; }
+            else if (is_repetition(g.root_pos, g.game_hashes)) { game_result = 0; is_terminal = true; }
+          }
+
+          if (is_terminal) {
+            for (int p = 0; p < g.ply_count; ++p) {
+              if (game_result == 0) {
+                g.game_history[p].outcome = 0;
+              } else {
+                bool is_white_turn = (p % 2 == 0);
+                g.game_history[p].outcome = (game_result == 1) ? (is_white_turn ? 1 : -1) : (is_white_turn ? -1 : 1);
+              }
+            }
+
+            // CRITICAL: Lock mutex before writing to the shared file
+            {
+              std::lock_guard<std::mutex> lock(file_mutex);
+              save_game_to_binary(g.game_history, out);
+              int current_games = ++games_completed; // Increment atomic inside lock
+              positions_written += g.game_history.size();
+
+              std::cout << "                   Games completed: " << current_games << " / " << total_games_to_play 
+                            << " (Positions written: " << positions_written.load() << ")\r" << std::flush;
+
+              // Reset game logic
+              if (current_games + datagenbatchsize <= total_games_to_play) {
+                 g.root_pos.initialize();
+                 g.game_history.clear();
+                 g.game_hashes.clear();
+                 g.ply_count = 0;
+              } else {
+                 g.is_active = false;
+              }
+            }
+          }
+
+          if (g.root_pos.halfmovecount == 0 && !is_terminal) {
+            g.game_hashes.clear();
+          }
+          g.arena.clear();
+          g.rollouts_completed = 0;
+        }
       }
-      g.arena.clear();
-      g.rollouts_completed = 0;
+
+      sync_point.arrive_and_wait(); // Wait before starting the next cycle
     }
+  };
+
+  // --- Fire up the threads ---
+  std::vector<std::thread> threads;
+  for (int i = 0; i < datagenthreads; ++i) {
+    threads.emplace_back(worker, i);
+  }
+
+  // --- Wait for the entire datagen run to finish ---
+  for (auto &t : threads) {
+    t.join();
   }
 }
+
+

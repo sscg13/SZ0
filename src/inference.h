@@ -37,27 +37,39 @@ public:
             Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
     Ort::SessionOptions session_options;
     session_options.SetIntraOpNumThreads(1);
-    session_options.SetGraphOptimizationLevel(
-        GraphOptimizationLevel::ORT_ENABLE_ALL);
+    session_options.SetInterOpNumThreads(1);
+    session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    //session_options.EnableProfiling("shatranj_profile.json");
 
     // TODO: CUDA
-    /*
+#ifdef USE_CUDA
     try {
         OrtCUDAProviderOptionsV2* cuda_options = nullptr;
         Ort::GetApi().CreateCUDAProviderOptions(&cuda_options);
 
-        // Optional: Set specific GPU options (Device 0, use Arena, etc.)
         std::vector<const char*> keys = {"device_id", "arena_extend_strategy"};
         std::vector<const char*> values = {"0", "kSameAsRequested"};
         Ort::GetApi().UpdateCUDAProviderOptions(cuda_options, keys.data(), values.data(), keys.size());
 
-        session_options.AppendExecutionProvider_CUDA_V2(cuda_options);
+        // Use the C-API directly to bypass the C++ reference bug.
+        // The C++ session_options object implicitly converts to OrtSessionOptions*
+        OrtStatus* status = Ort::GetApi().SessionOptionsAppendExecutionProvider_CUDA_V2(
+            session_options, 
+            cuda_options
+        );
+
+        if (status != nullptr) {
+            fprintf(stderr, "Failed to append CUDA provider: %s\n", Ort::GetApi().GetErrorMessage(status));
+            Ort::GetApi().ReleaseStatus(status);
+        } else {
+            printf("CUDA Execution Provider attached successfully.\n");
+        }
         
-        // Always release the options pointer after appending
         Ort::GetApi().ReleaseCUDAProviderOptions(cuda_options);
     } catch (const Ort::Exception& e) {
-        fprintf(stderr, "Warning: CUDA not available, falling back to CPU. Error: %s\n", e.what());
-    }*/
+        fprintf(stderr, "Warning: CUDA exception caught. Error: %s\n", e.what());
+    }
+#endif
 
 #ifdef _WIN32
     // Windows requires wide strings (wchar_t) for paths
@@ -72,4 +84,8 @@ public:
 
   NNOutput infer(const Position &pos);
   std::vector<NNOutput> infer_batch(const std::vector<Position> &positions);
+  void infer_packed(const std::vector<int32_t>& flat_pieces, 
+                    const std::vector<int32_t>& flat_halfmoves,
+                    std::vector<NNOutput>& shared_results,
+                    const std::vector<int>& batch_to_game_idx);
 };

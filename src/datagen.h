@@ -36,6 +36,5 @@ struct DatagenGame {
 
 void generate_batched_selfplay_games(NNEvaluator &nn, 
                                      const std::string &output_prefix, 
-                                     U64 nodecount, 
-                                     int concurrent_games, 
+                                     U64 nodecount,
                                      int total_games_to_play);

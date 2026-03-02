@@ -51,3 +51,5 @@ enum PieceType : U8 {
 };
 constexpr int defaultarenasize = 3145728;
 constexpr int datagenarenasize = 65536;
+constexpr int datagenbatchsize = 128;
+constexpr int datagenthreads = 8;

@@ -142,7 +142,7 @@ def train():
     return state
 
 # Create an absolute path for your checkpoints
-ckpt_dir = os.path.abspath("./sz0_weights")
+ckpt_dir = os.path.abspath("./sz0_small_run1")
 # Configure the manager (e.g., only keep the 5 most recent checkpoints)
 options = ocp.CheckpointManagerOptions(max_to_keep=5, create=True)
 # Initialize the manager using the modern API

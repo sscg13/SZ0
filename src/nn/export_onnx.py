@@ -6,10 +6,12 @@ import orbax.checkpoint as ocp
 from flax.training import train_state
 import optax
 from jax2onnx import to_onnx
+from onnxruntime.transformers.optimizer import optimize_model
 
 from architecture import ShatranjNet 
 
-def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path="shatranj_v1.onnx"):
+
+def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batch_size):
     print("1. Loading Orbax Checkpoint...")
     model = ShatranjNet()
     
@@ -44,24 +46,35 @@ def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path="shat
         return model.apply({'params': loaded_params}, board, halfmove)
 
     input_signatures = [
-        jax.ShapeDtypeStruct(shape=("b", 64), dtype=jnp.int32),
-        jax.ShapeDtypeStruct(shape=("b",), dtype=jnp.int32)
+        jax.ShapeDtypeStruct(shape=(batch_size, 64), dtype=jnp.int32),
+        jax.ShapeDtypeStruct(shape=(batch_size,), dtype=jnp.int32)
     ]
-    print("3. Exporting directly to ONNX...")
+    print("3. Exporting directly to ONNX (Batch Size: {batch_size})...")
     to_onnx(
         forward_pass,
         input_signatures, 
         return_mode="file",
-        output_path=output_onnx_path
+        output_path=f"temp_{output_onnx_path}",
+        opset=20
     )
     
-    print(f"Success! Universal ONNX model saved to: {output_onnx_path}")
+    print("4. Optimizing...")
+    optimized = optimize_model(
+        f"temp_{output_onnx_path}",
+        model_type='bert', # 'bert' is the generic trigger for Encoder fusions
+        num_heads=8,       # Set to your ShatranjNet head count
+        hidden_size=256    # Set to your d_model (looks like 256 in your Netron pic)
+    )
+    
+    optimized.save_model_to_file(output_onnx_path)
+    print(f"Success! ONNX model saved to: {output_onnx_path}")
 
 
 if __name__ == "__main__":
-    input_base_dir = os.path.abspath("./sz0_weights")
+    input_base_dir = os.path.abspath("./sz0_small_run1")
     step = 9 
-    output_filename = "sz0_epoch9.onnx"
+    output_filename = "sz0_small_batch128.onnx"
+    batch_size = 128
     
     print(f"Starting conversion for step {step} in {input_base_dir}...")
-    export_jax_to_onnx(input_base_dir, step, output_filename)
+    export_jax_to_onnx(input_base_dir, step, output_filename, batch_size)

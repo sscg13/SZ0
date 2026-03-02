@@ -28,7 +28,7 @@ void uci() {
   current_pos.initialize();
   TreeArena arena(defaultarenasize);
   std::vector<U64> game_hashes;
-  NNEvaluator nn("sz0_epoch9.onnx");
+  NNEvaluator nn(NNFILE);
   int threadcount = 1;
 
   while (std::getline(std::cin, ucicommand)) {
@@ -148,23 +148,21 @@ int main(int argc, char *argv[]) {
   initializezobrist();
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc > 1 && std::string(argv[1]) == "datagen") {
-    if (argc != 6) {
-      std::cerr << "Proper usage: ./(exe) datagen <game_count> <concurrency> "
+    if (argc < 5) {
+      std::cerr << "Proper usage: ./(exe) datagen <game_count> "
                    "<nodes> <output_file>\n";
       return 0;
     }
     int num_games = atoi(argv[2]);
-    int concurrency = atoi(argv[3]);
-    int node_limit = atoi(argv[4]);
-    std::string outputfile(argv[5]);
+    int node_limit = atoi(argv[3]);
+    std::string outputfile(argv[4]);
 
     std::cout << "Starting Data Generation Engine...\n";
-    std::cout << "Concurrency: " << concurrency << "\n";
     std::cout << "Nodes/Move: " << node_limit << "\n";
     std::cout << "Data Output: " << outputfile << ".data\n";
 
-    NNEvaluator nn("sz0_epoch9.onnx");
-    generate_batched_selfplay_games(nn, outputfile, node_limit, concurrency, num_games);
+    NNEvaluator nn(NNFILE);
+    generate_batched_selfplay_games(nn, outputfile, node_limit, num_games);
 
     return 0;
   } else {

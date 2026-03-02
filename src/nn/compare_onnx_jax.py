@@ -9,7 +9,7 @@ import orbax.checkpoint as ocp
 from flax.training import train_state
 import optax
 
-def verify_models(seed, checkpoint_base_dir, step_to_load, onnx_path="sz0_epoch9.onnx"):
+def verify_models(seed, checkpoint_base_dir, step_to_load, onnx_path="sz0_small_epoch9.onnx"):
     print("1. Loading JAX Model...")
     model = ShatranjNet()
     dummy_board = jnp.zeros((1, 64), dtype=jnp.int32)
@@ -68,4 +68,4 @@ def verify_models(seed, checkpoint_base_dir, step_to_load, onnx_path="sz0_epoch9
     print("Do the models pick the same top move?", np.argmax(jax_policy_np) == np.argmax(onnx_policy_np))
 
 if __name__ == "__main__":
-    verify_models(18782, os.path.abspath("./sz0_weights"), 9, "sz0_epoch9.onnx")
+    verify_models(2349, os.path.abspath("./sz0_small_run1"), 9, "sz0_small_epoch9.onnx")
