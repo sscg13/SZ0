@@ -1,9 +1,11 @@
+#include "inference.h"
 #include "position.h"
 
 #include <atomic>
 #include <memory>
 #include <random>
 #include <vector>
+
 #pragma once
 
 struct alignas(8) Node {
@@ -18,7 +20,7 @@ struct alignas(8) Node {
   std::atomic<U8> virtual_visits;
 
   Node()
-      : first_child_idx(0), visits(0), value_sum(0.0f), prior(0.0f),
+      : first_child_idx(-1), visits(0), value_sum(0.0f), prior(0.0f),
         move(Move()), num_children(0), virtual_visits(0) {}
 };
 
@@ -27,9 +29,9 @@ struct TreeArena {
   std::atomic<size_t> active_nodes;
   size_t max_nodes;
 
-  TreeArena(size_t initial_capacity = 3145728) {
+  TreeArena(size_t initial_capacity) {
     nodes = std::make_unique<Node[]>(initial_capacity);
-    active_nodes.store(0, std::memory_order_relaxed);
+    active_nodes.store(1, std::memory_order_relaxed);
     max_nodes = initial_capacity;
   }
 
@@ -37,7 +39,8 @@ struct TreeArena {
   void clear();
 };
 
-float dummy_evaluate(const Position &pos);
+bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
+                   const std::vector<U64> &rollout_hashes);
 U32 select_best_puct(const TreeArena &arena, U32 node_idx);
-int mcts_rollout(TreeArena &arena, const Position &root_pos,
+int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
                  const std::vector<U64> &game_hashes);

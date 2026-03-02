@@ -49,3 +49,7 @@ enum PieceType : U8 {
   Rook = 6,
   King = 7
 };
+constexpr int defaultarenasize = 3145728;
+constexpr int datagenarenasize = 65536;
+constexpr int datagenbatchsize = 128;
+constexpr int datagenthreads = 8;

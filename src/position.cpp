@@ -188,6 +188,13 @@ std::string get129600FEN(int seed1, int seed2) {
   FEN += " w - - 0 1";
   return FEN;
 }
+int perspectivepiece(Piece p, bool stm) {
+  if (p.empty()) {
+    return 0;
+  } else {
+    return p.type() + ((p.color() == stm) ? 0 : 6) - 1;
+  }
+}
 U64 Position::scratchzobrist() {
   U64 scratch = 0ULL;
   for (int i = 0; i < 64; i++) {
@@ -229,16 +236,6 @@ bool Position::twokings() {
 }
 bool Position::bareking(bool color) {
   return (Bitboards[color] & Bitboards[King]) == Bitboards[color];
-}
-int Position::material() const {
-  int material_values[5] = {100, 100, 170, 370, 640};
-  int value = 0;
-  for (int i = Pawn; i < King; i++) {
-    value += material_values[i - 2] *
-             (std::popcount(Bitboards[stm] & Bitboards[i]) -
-              std::popcount(Bitboards[!stm] & Bitboards[i]));
-  }
-  return value;
 }
 U64 Position::checkers(int color) {
   int kingsquare = std::countr_zero(Bitboards[color] & Bitboards[King]);

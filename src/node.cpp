@@ -22,18 +22,6 @@ void TreeArena::resize(int megabytes) {
   max_nodes = new_max_nodes;
 }
 
-float dummy_evaluate(const Position &pos) {
-  thread_local std::mt19937 rng(std::random_device{}());
-  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
-  return dist(rng);
-}
-
-float materialist(const Position &pos) {
-  int material = pos.material();
-  return std::tanh(static_cast<float>(material) / 400.0f);
-}
-
 U32 select_best_puct(const TreeArena &arena, U32 node_idx) {
   const Node &parent = arena.nodes[node_idx];
   const float c_puct = 2.0f;
@@ -100,7 +88,7 @@ bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
   return false;
 }
 
-int mcts_rollout(TreeArena &arena, const Position &root_pos,
+int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
                  const std::vector<U64> &game_hashes) {
   Position current_pos = root_pos;
   U32 current_idx = 0;
@@ -145,41 +133,50 @@ int mcts_rollout(TreeArena &arena, const Position &root_pos,
       } else {
         Move moves[maxmoves];
         int movecount = current_pos.generatemoves(moves);
+
         if (movecount == 0) {
           value = -1.0f;
         } else {
+          NNOutput raw_nn = nn.infer(current_pos);
+          MCTSEval processed =
+              parse_nn_output(raw_nn, moves, movecount, current_pos.stm);
+          value = processed.qscore;
+
           U32 child_start = arena.active_nodes.fetch_add(
               movecount, std::memory_order_relaxed);
 
           if (child_start + movecount < arena.max_nodes) {
-            for (size_t i = 0; i < movecount; i++) {
+            for (int i = 0; i < movecount; i++) {
               size_t child_idx = child_start + i;
               arena.nodes[child_idx].move = moves[i];
+              arena.nodes[child_idx].prior = processed.priors[i];
+
               arena.nodes[child_idx].visits.store(0, std::memory_order_relaxed);
               arena.nodes[child_idx].value_sum.store(0.0f,
                                                      std::memory_order_relaxed);
               arena.nodes[child_idx].first_child_idx = -1;
               arena.nodes[child_idx].num_children = 0;
               arena.nodes[child_idx].is_expanding.clear(
-                  std::memory_order_release);
+                  std::memory_order_relaxed);
+              arena.nodes[child_idx].virtual_visits.store(
+                  0, std::memory_order_relaxed);
             }
+
             std::atomic_thread_fence(std::memory_order_release);
             arena.nodes[current_idx].first_child_idx = child_start;
             arena.nodes[current_idx].num_children = movecount;
-            float uniform_prior = 1.0f / movecount;
-            for (int i = 0; i < movecount; ++i) {
-              arena.nodes[child_start + i].move = moves[i];
-              arena.nodes[child_start + i].prior = uniform_prior;
-              arena.active_nodes++;
-            }
           }
-
-          // Get the dummy evaluation (soon to be neural network)
-          value = materialist(current_pos);
         }
       }
     } else {
-      value = materialist(current_pos);
+      for (int i = search_path.size() - 1; i >= 0; --i) {
+        U32 idx = search_path[i];
+        if (i > 0) {
+          arena.nodes[idx].virtual_visits.fetch_sub(1,
+                                                    std::memory_order_relaxed);
+        }
+      }
+      return 0;
     }
   }
 

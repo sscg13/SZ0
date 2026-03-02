@@ -17,12 +17,19 @@ template <typename T> void atomic_fetch_max(std::atomic<T> &obj, T val) {
   }
 }
 
+int scoretocp(float q) {
+  float clamped_q = std::clamp(q, -0.9999f, 0.9999f);
+  float cp = 400.0 * std::atanh(clamped_q);
+
+  return static_cast<int>(std::round(cp));
+}
+
 void printinfostring(const TreeArena &arena, int timetaken, int avgdepth,
                      int seldepth) {
   U32 current_idx = 0;
   std::stringstream pv;
   int nodecount = arena.nodes[0].visits;
-  int score = 1000 * (arena.nodes[0].value_sum / nodecount);
+  int score = scoretocp(arena.nodes[0].value_sum / nodecount);
   while (arena.nodes[current_idx].num_children > 0) {
     U32 best_child = 0;
     I32 max_visits = -1;
@@ -46,10 +53,14 @@ void printinfostring(const TreeArena &arena, int timetaken, int avgdepth,
             << " pv " << pv.str() << "\n";
 }
 
-void mcts_worker(TreeArena &arena, Position root_pos,
+void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
                  std::vector<uint64_t> game_history) {
   while (!stop_search.load(std::memory_order_relaxed)) {
-    int depth = mcts_rollout(arena, root_pos, game_history);
+    int depth = mcts_rollout(nn, arena, root_pos, game_history);
+    if (depth == 0) {
+      std::this_thread::yield();
+      continue;
+    }
     total_rollouts.fetch_add(1, std::memory_order_relaxed);
     if (arena.active_nodes.load(std::memory_order_relaxed) >=
         arena.max_nodes - 256) {
@@ -76,9 +87,10 @@ Move get_best_move(TreeArena &arena) {
   return arena.nodes[best_child_idx].move;
 }
 
-void search_position(TreeArena &arena, const Position &current_pos,
+void search_position(NNEvaluator &nn, TreeArena &arena,
+                     const Position &current_pos,
                      const std::vector<uint64_t> &game_hashes, int timelimit,
-                     int threadcount) {
+                     U64 nodelimit, int threadcount, bool print_info) {
   stop_search.store(false, std::memory_order_relaxed);
   total_rollouts.store(0, std::memory_order_relaxed);
   seldepth.store(0, std::memory_order_relaxed);
@@ -90,8 +102,8 @@ void search_position(TreeArena &arena, const Position &current_pos,
 
   std::vector<std::thread> threads;
   for (int i = 0; i < threadcount; ++i) {
-    threads.emplace_back(mcts_worker, std::ref(arena), current_pos,
-                         game_hashes);
+    threads.emplace_back(mcts_worker, std::ref(nn), std::ref(arena),
+                         current_pos, game_hashes);
   }
   while (!stop_search.load(std::memory_order_relaxed)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -99,7 +111,13 @@ void search_position(TreeArena &arena, const Position &current_pos,
     auto elapsed =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
             .count();
-    if (elapsed >= timelimit) {
+    if (elapsed >= timelimit && timelimit > 0) {
+      stop_search.store(true, std::memory_order_relaxed);
+      break;
+    }
+
+    U64 current_nodes = total_rollouts.load(std::memory_order_relaxed);
+    if (current_nodes >= nodelimit && nodelimit > 0) {
       stop_search.store(true, std::memory_order_relaxed);
       break;
     }
@@ -107,9 +125,7 @@ void search_position(TreeArena &arena, const Position &current_pos,
     auto time_since_info =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - last_info)
             .count();
-    if (time_since_info >= 400) {
-      uint64_t current_nodes = total_rollouts.load(std::memory_order_relaxed);
-      uint64_t nps = (elapsed > 0) ? (current_nodes * 1000ULL) / elapsed : 0;
+    if (time_since_info >= 400 && print_info && current_nodes > 0) {
 
       printinfostring(arena, elapsed,
                       depthsum.load(std::memory_order_relaxed) /
@@ -129,10 +145,12 @@ void search_position(TreeArena &arena, const Position &current_pos,
   auto elapsed =
       std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
           .count();
-  printinfostring(arena, elapsed,
-                  depthsum.load(std::memory_order_relaxed) /
-                      total_rollouts.load(std::memory_order_relaxed),
-                  seldepth.load(std::memory_order_relaxed));
+  if (print_info) {
+    printinfostring(arena, elapsed,
+                    depthsum.load(std::memory_order_relaxed) /
+                        total_rollouts.load(std::memory_order_relaxed),
+                    seldepth.load(std::memory_order_relaxed));
+  }
   Move best = get_best_move(arena);
   if (best == Move()) {
     Move moves[maxmoves];
@@ -140,5 +158,7 @@ void search_position(TreeArena &arena, const Position &current_pos,
     copy_pos.generatemoves(moves);
     best = moves[0];
   }
-  std::cout << "bestmove " << algebraic(best) << "\n";
+  if (print_info) {
+    std::cout << "bestmove " << algebraic(best) << "\n";
+  }
 }

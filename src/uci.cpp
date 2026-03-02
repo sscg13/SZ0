@@ -1,3 +1,5 @@
+#include "datagen.h"
+#include "inference.h"
 #include "node.h"
 #include "position.h"
 #include "search.h"
@@ -7,6 +9,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 // clang-format off
@@ -23,8 +26,9 @@ void uci() {
   std::string ucicommand;
   Position current_pos;
   current_pos.initialize();
-  TreeArena arena(3145728);
+  TreeArena arena(defaultarenasize);
   std::vector<U64> game_hashes;
+  NNEvaluator nn(NNFILE);
   int threadcount = 1;
 
   while (std::getline(std::cin, ucicommand)) {
@@ -82,7 +86,7 @@ void uci() {
       int winc = 0;
       int binc = 0;
       int movetime = 0;
-      int nodecount = 0;
+      U64 nodecount = 0;
       while (tokens >> token) {
         if (token == "wtime") {
           tokens >> token;
@@ -113,11 +117,12 @@ void uci() {
         int ourtime = current_pos.stm ? btime : wtime;
         int ourinc = current_pos.stm ? binc : winc;
         if (ourtime > 0) {
-          movetime = (ourtime + 9 * ourinc) / 10;
+          movetime = (ourtime + 7 * ourinc) / 10;
         }
       }
       arena.clear();
-      search_position(arena, current_pos, game_hashes, movetime, threadcount);
+      search_position(nn, arena, current_pos, game_hashes, movetime, nodecount,
+                      threadcount, true);
     }
     if (token == "setoption") {
       tokens >> token;
@@ -136,12 +141,32 @@ void uci() {
   }
 }
 
-int main() {
+int main(int argc, char *argv[]) {
   initializeleaperattacks();
   initializemasks();
   initializerankattacks();
   initializezobrist();
   setvbuf(stdout, NULL, _IONBF, 0);
-  uci();
+  if (argc > 1 && std::string(argv[1]) == "datagen") {
+    if (argc < 5) {
+      std::cerr << "Proper usage: ./(exe) datagen <game_count> "
+                   "<nodes> <output_file>\n";
+      return 0;
+    }
+    int num_games = atoi(argv[2]);
+    int node_limit = atoi(argv[3]);
+    std::string outputfile(argv[4]);
+
+    std::cout << "Starting Data Generation Engine...\n";
+    std::cout << "Nodes/Move: " << node_limit << "\n";
+    std::cout << "Data Output: " << outputfile << ".data\n";
+
+    NNEvaluator nn(NNFILE);
+    generate_batched_selfplay_games(nn, outputfile, node_limit, num_games);
+
+    return 0;
+  } else {
+    uci();
+  }
   return 0;
 }

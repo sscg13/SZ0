@@ -6,6 +6,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+
 #pragma once
 
 struct Piece {
@@ -53,7 +54,6 @@ struct Position {
   void initialize();
   bool twokings();
   bool bareking(bool color);
-  int material() const;
   U64 checkers(int color);
   void makemove(Move mov);
   void unmakemove(Move mov);
@@ -70,3 +70,4 @@ void initializerankattacks();
 void initializezobrist();
 std::string algebraic(Move mov);
 std::string get129600FEN(int seed1, int seed2);
+int perspectivepiece(Piece p, bool stm);
