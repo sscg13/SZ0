@@ -20,7 +20,7 @@ template <typename T> void atomic_fetch_max(std::atomic<T> &obj, T val) {
 int scoretocp(float q) {
   float clamped_q = std::clamp(q, -0.9999f, 0.9999f);
   float cp = 400.0 * std::atanh(clamped_q);
-    
+
   return static_cast<int>(std::round(cp));
 }
 

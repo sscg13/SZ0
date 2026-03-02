@@ -21,7 +21,6 @@ MCTSEval parse_nn_output(const NNOutput &raw_nn, const Move *moves,
                          int movecount, bool stm);
 
 class NNEvaluator {
-private:
   Ort::Env env;
   Ort::Session session{nullptr};
   Ort::MemoryInfo memory_info;
@@ -38,36 +37,38 @@ public:
     Ort::SessionOptions session_options;
     session_options.SetIntraOpNumThreads(1);
     session_options.SetInterOpNumThreads(1);
-    session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-    //session_options.EnableProfiling("shatranj_profile.json");
+    session_options.SetGraphOptimizationLevel(
+        GraphOptimizationLevel::ORT_ENABLE_ALL);
+    // session_options.EnableProfiling("shatranj_profile.json");
 
-    // TODO: CUDA
 #ifdef USE_CUDA
     try {
-        OrtCUDAProviderOptionsV2* cuda_options = nullptr;
-        Ort::GetApi().CreateCUDAProviderOptions(&cuda_options);
+      OrtCUDAProviderOptionsV2 *cuda_options = nullptr;
+      Ort::GetApi().CreateCUDAProviderOptions(&cuda_options);
 
-        std::vector<const char*> keys = {"device_id", "arena_extend_strategy"};
-        std::vector<const char*> values = {"0", "kSameAsRequested"};
-        Ort::GetApi().UpdateCUDAProviderOptions(cuda_options, keys.data(), values.data(), keys.size());
+      std::vector<const char *> keys = {"device_id", "arena_extend_strategy"};
+      std::vector<const char *> values = {"0", "kSameAsRequested"};
+      Ort::GetApi().UpdateCUDAProviderOptions(cuda_options, keys.data(),
+                                              values.data(), keys.size());
 
-        // Use the C-API directly to bypass the C++ reference bug.
-        // The C++ session_options object implicitly converts to OrtSessionOptions*
-        OrtStatus* status = Ort::GetApi().SessionOptionsAppendExecutionProvider_CUDA_V2(
-            session_options, 
-            cuda_options
-        );
+      // Use the C-API directly to bypass the C++ reference bug.
+      // The C++ session_options object implicitly converts to
+      // OrtSessionOptions*
+      OrtStatus *status =
+          Ort::GetApi().SessionOptionsAppendExecutionProvider_CUDA_V2(
+              session_options, cuda_options);
 
-        if (status != nullptr) {
-            fprintf(stderr, "Failed to append CUDA provider: %s\n", Ort::GetApi().GetErrorMessage(status));
-            Ort::GetApi().ReleaseStatus(status);
-        } else {
-            printf("CUDA Execution Provider attached successfully.\n");
-        }
-        
-        Ort::GetApi().ReleaseCUDAProviderOptions(cuda_options);
-    } catch (const Ort::Exception& e) {
-        fprintf(stderr, "Warning: CUDA exception caught. Error: %s\n", e.what());
+      if (status != nullptr) {
+        fprintf(stderr, "Failed to append CUDA provider: %s\n",
+                Ort::GetApi().GetErrorMessage(status));
+        Ort::GetApi().ReleaseStatus(status);
+      } else {
+        printf("CUDA Execution Provider attached successfully.\n");
+      }
+
+      Ort::GetApi().ReleaseCUDAProviderOptions(cuda_options);
+    } catch (const Ort::Exception &e) {
+      fprintf(stderr, "Warning: CUDA exception caught. Error: %s\n", e.what());
     }
 #endif
 
@@ -83,8 +84,8 @@ public:
   }
 
   NNOutput infer(const Position &pos);
-  void infer_packed(const std::vector<int32_t>& flat_pieces, 
-                    const std::vector<int32_t>& flat_halfmoves,
-                    std::vector<NNOutput>& shared_results,
-                    const std::vector<int>& batch_to_game_idx);
+  void infer_packed(const std::vector<int32_t> &flat_pieces,
+                    const std::vector<int32_t> &flat_halfmoves,
+                    std::vector<NNOutput> &shared_results,
+                    const std::vector<int> &batch_to_game_idx);
 };

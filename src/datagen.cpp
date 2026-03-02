@@ -87,7 +87,7 @@ void backprop(DatagenGame &game, float value) {
 bool select(DatagenGame &game) {
   game.search_path.clear();
   game.leaf_pos = game.root_pos;
-  U32 current_idx = 0; 
+  U32 current_idx = 0;
   game.search_path.push_back(current_idx);
 
   std::vector<uint64_t> rollout_hashes;
@@ -98,7 +98,7 @@ bool select(DatagenGame &game) {
     U32 best_child_idx = select_best_puct(game.arena, current_idx);
     game.leaf_pos.makemove(game.arena.nodes[best_child_idx].move);
     current_idx = best_child_idx;
-    
+
     game.search_path.push_back(current_idx);
     rollout_hashes.push_back(game.leaf_pos.zobristhash);
   }
@@ -107,25 +107,36 @@ bool select(DatagenGame &game) {
   float value = 0.0f;
   bool is_terminal = false;
 
-  if (game.leaf_pos.twokings()) { value = 0.0f; is_terminal = true; }
-  else if (game.leaf_pos.bareking(!game.leaf_pos.stm)) { value = 1.0f; is_terminal = true; }
-  else if (game.leaf_pos.halfmovecount >= 140) { value = 0.0f; is_terminal = true; }
-  else if (is_repetition(game.leaf_pos, game.game_hashes, rollout_hashes)) { value = 0.0f; is_terminal = true; }
-  else {
+  if (game.leaf_pos.twokings()) {
+    value = 0.0f;
+    is_terminal = true;
+  } else if (game.leaf_pos.bareking(!game.leaf_pos.stm)) {
+    value = 1.0f;
+    is_terminal = true;
+  } else if (game.leaf_pos.halfmovecount >= 140) {
+    value = 0.0f;
+    is_terminal = true;
+  } else if (is_repetition(game.leaf_pos, game.game_hashes, rollout_hashes)) {
+    value = 0.0f;
+    is_terminal = true;
+  } else {
     Move moves[maxmoves];
     int movecount = game.leaf_pos.generatemoves(moves);
-    if (movecount == 0) { value = -1.0f; is_terminal = true; }
+    if (movecount == 0) {
+      value = -1.0f;
+      is_terminal = true;
+    }
   }
 
   // If terminal, backprop immediately and bypass the GPU
   if (is_terminal) {
     backprop(game, value);
     game.rollouts_completed++;
-    return false; 
+    return false;
   }
 
   // Wait for GPU batch
-  return true; 
+  return true;
 }
 
 void expand(DatagenGame &game, const NNOutput &raw_nn) {
@@ -134,11 +145,12 @@ void expand(DatagenGame &game, const NNOutput &raw_nn) {
   Move moves[maxmoves];
   int movecount = game.leaf_pos.generatemoves(moves);
 
-  MCTSEval processed = parse_nn_output(raw_nn, moves, movecount, game.leaf_pos.stm);
+  MCTSEval processed =
+      parse_nn_output(raw_nn, moves, movecount, game.leaf_pos.stm);
   float value = processed.qscore;
 
-  U32 child_start = game.arena.active_nodes; 
-  
+  U32 child_start = game.arena.active_nodes;
+
   if (child_start + movecount < game.arena.max_nodes) {
     game.arena.active_nodes.fetch_add(movecount, std::memory_order_relaxed);
 
@@ -155,23 +167,20 @@ void expand(DatagenGame &game, const NNOutput &raw_nn) {
     game.arena.nodes[current_idx].first_child_idx = child_start;
     game.arena.nodes[current_idx].num_children = movecount;
   }
-
-  // Finish the backprop!
   backprop(game, value);
   game.rollouts_completed++;
 }
 
-void generate_batched_selfplay_games(NNEvaluator &nn, 
-                                     const std::string &output_prefix, 
-                                     U64 nodecount,
-                                     int total_games_to_play) {
+void generate_batched_selfplay_games(NNEvaluator &nn,
+                                     const std::string &output_prefix,
+                                     U64 nodecount, int total_games_to_play) {
   std::string filename = output_prefix + ".data";
   std::ofstream out(filename, std::ios::binary | std::ios::app);
   if (!out.is_open()) {
     std::cerr << "Failed to open output file!" << std::endl;
     return;
   }
-  
+
   auto begin = std::chrono::high_resolution_clock::now();
   auto last_print = begin;
   int total_nodes_evaluated = 0;
@@ -184,11 +193,10 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   }
 
   // --- Multi-threading Setup ---
-  std::mutex file_mutex; // Protects file writes and console output
+  std::mutex file_mutex;
   std::atomic<int> games_completed{0};
   std::atomic<int> positions_written{0};
   std::atomic<bool> keep_running{true};
-
 
   std::vector<U8> shared_needs_nn(datagenbatchsize, 0);
   std::vector<NNOutput> shared_nn_results(datagenbatchsize);
@@ -196,8 +204,9 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   // Pre-allocated flat arrays for the GPU batch
   std::vector<int32_t> batched_pieces(datagenbatchsize * 64);
   std::vector<int32_t> batched_halfmoves(datagenbatchsize);
-  
-  // Maps the dense GPU batch index (0 to current_batch_size) back to the global game index (0 to datagenbatchsize)
+
+  // Maps the dense GPU batch index (0 to current_batch_size) back to the global
+  // game index (0 to datagenbatchsize)
   std::vector<int> batch_to_game_idx(datagenbatchsize);
   std::atomic<int> current_batch_size{0};
 
@@ -206,88 +215,98 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   auto worker = [&](int thread_idx) {
     int chunk_size = datagenbatchsize / datagenthreads;
     int start_idx = thread_idx * chunk_size;
-    int end_idx = (thread_idx == datagenthreads - 1) ? datagenbatchsize : start_idx + chunk_size;
+    int end_idx = (thread_idx == datagenthreads - 1) ? datagenbatchsize
+                                                     : start_idx + chunk_size;
 
-    // VERY IMPORTANT: RNG must be thread-local to prevent massive lock contention/segfaults
-    std::mt19937 rng(std::random_device{}() + thread_idx); 
+    std::mt19937 rng(std::random_device{}() + thread_idx);
     std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
 
     while (true) {
-      
+
       // ==========================================
-      // PHASE 1: MCTS Select (Parallelized)
+      // MCTS Select (Parallelized)
       // ==========================================
       for (int i = start_idx; i < end_idx; ++i) {
         shared_needs_nn[i] = 0;
         DatagenGame &g = *games[i];
-        if (!g.is_active) continue;
+        if (!g.is_active)
+          continue;
 
         if (g.rollouts_completed < nodecount) {
           bool needs_nn = select(g);
           if (needs_nn) {
             shared_needs_nn[i] = 1;
-            
+
             // Lock-free atomic reservation for this board's slot in the batch
-            int b_idx = current_batch_size.fetch_add(1, std::memory_order_relaxed);
+            int b_idx =
+                current_batch_size.fetch_add(1, std::memory_order_relaxed);
             batch_to_game_idx[b_idx] = i;
 
-            // Thread computes perspective flips directly into the shared GPU buffer!
+            // Thread computes perspective flips directly into the shared GPU
+            // buffer
             for (int sq = 0; sq < 64; ++sq) {
               int p_sq = g.leaf_pos.stm ? (sq ^ 56) : sq;
-              batched_pieces[(b_idx * 64) + p_sq] = perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm);
+              batched_pieces[(b_idx * 64) + p_sq] =
+                  perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm);
             }
             batched_halfmoves[b_idx] = g.leaf_pos.halfmovecount;
           }
         }
       }
-      
-      
-        if (!keep_running.load(std::memory_order_relaxed)) {
-          sync_point.arrive_and_drop();
-          break;
+
+      if (!keep_running.load(std::memory_order_relaxed)) {
+        sync_point.arrive_and_drop();
+        break;
       }
       sync_point.arrive_and_wait();
 
       // ==========================================
-      // PHASE 2: GPU Inference (Thread 0 Only)
+      // GPU Inference (Thread 0 Only)
       // ==========================================
       if (thread_idx == 0) {
         int batch_size = current_batch_size.load(std::memory_order_relaxed);
         total_nodes_evaluated += batch_size;
-        
+
         if (batch_size > 0) {
           // Hand the pre-packed flat arrays directly to ONNX
-          nn.infer_packed(batched_pieces, batched_halfmoves, shared_nn_results, batch_to_game_idx);
+          nn.infer_packed(batched_pieces, batched_halfmoves, shared_nn_results,
+                          batch_to_game_idx);
         }
 
         // Reset the atomic batch size for the next MCTS loop
         current_batch_size.store(0, std::memory_order_relaxed);
 
-        if (games_completed.load(std::memory_order_relaxed) >= total_games_to_play) {
+        if (games_completed.load(std::memory_order_relaxed) >=
+            total_games_to_play) {
           keep_running.store(false, std::memory_order_relaxed);
         }
         auto now = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_print).count();
-        int nps = 1000 * total_nodes_evaluated / std::chrono::duration_cast<std::chrono::milliseconds>(now - begin).count();
-        if (duration >= 1000) { // Print every 1 second
-            std::cout << "TRUE NPS: " << nps << "\r" << std::flush;
-            last_print = now;
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - last_print)
+                            .count();
+        int nps =
+            1000 * total_nodes_evaluated /
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - begin)
+                .count();
+        if (duration >= 1000) {
+          std::cout << "TRUE NPS: " << nps << "\r" << std::flush;
+          last_print = now;
         }
       }
-      
-      
+
       if (!keep_running.load(std::memory_order_relaxed)) {
-          sync_point.arrive_and_drop();
-          break;
+        sync_point.arrive_and_drop();
+        break;
       }
       sync_point.arrive_and_wait();
 
       // ==========================================
-      // PHASE 3: Expand & Move Check (Parallelized)
+      // Expand & Move Check (Parallelized)
       // ==========================================
       for (int i = start_idx; i < end_idx; ++i) {
         DatagenGame &g = *games[i];
-        if (!g.is_active) continue;
+        if (!g.is_active)
+          continue;
 
         if (shared_needs_nn[i] && g.rollouts_completed < nodecount) {
           expand(g, shared_nn_results[i]);
@@ -295,7 +314,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
 
         if (g.rollouts_completed >= nodecount) {
           Node &root = g.arena.nodes[0];
-          int game_result = 0; 
+          int game_result = 0;
           bool is_terminal = false;
 
           if (root.num_children == 0) {
@@ -304,14 +323,18 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
           } else {
             int total_child_visits = 0;
             for (int c = 0; c < root.num_children; ++c) {
-              total_child_visits += g.arena.nodes[root.first_child_idx + c].visits.load(std::memory_order_relaxed);
+              total_child_visits +=
+                  g.arena.nodes[root.first_child_idx + c].visits.load(
+                      std::memory_order_relaxed);
             }
 
             TrainingPosition train_pos;
             train_pos.halfmove_clock = g.root_pos.halfmovecount;
             get_canonical_tokens(g.root_pos, train_pos.board_tokens);
             train_pos.num_moves = root.num_children;
-            train_pos.root_q = root.value_sum / std::max(1, root.visits.load(std::memory_order_relaxed));
+            train_pos.root_q =
+                root.value_sum /
+                std::max(1, root.visits.load(std::memory_order_relaxed));
 
             float random_choice = prob_dist(rng);
             float cumulative_prob = 0.0f;
@@ -320,7 +343,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             for (int c = 0; c < root.num_children; ++c) {
               Node &child = g.arena.nodes[root.first_child_idx + c];
               Move m = child.move;
-              
+
               int from_sq = g.root_pos.stm ? (m.from() ^ 56) : m.from();
               int to_sq = g.root_pos.stm ? (m.to() ^ 56) : m.to();
 
@@ -340,10 +363,19 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             g.root_pos.makemove(selected_move);
             g.ply_count++;
 
-            if (g.root_pos.twokings()) { game_result = 0; is_terminal = true; }
-            else if (g.root_pos.bareking(!g.root_pos.stm)) { game_result = g.root_pos.stm ? -1 : 1; is_terminal = true; }
-            else if (g.root_pos.halfmovecount >= 140) { game_result = 0; is_terminal = true; }
-            else if (is_repetition(g.root_pos, g.game_hashes)) { game_result = 0; is_terminal = true; }
+            if (g.root_pos.twokings()) {
+              game_result = 0;
+              is_terminal = true;
+            } else if (g.root_pos.bareking(!g.root_pos.stm)) {
+              game_result = g.root_pos.stm ? -1 : 1;
+              is_terminal = true;
+            } else if (g.root_pos.halfmovecount >= 140) {
+              game_result = 0;
+              is_terminal = true;
+            } else if (is_repetition(g.root_pos, g.game_hashes)) {
+              game_result = 0;
+              is_terminal = true;
+            }
           }
 
           if (is_terminal) {
@@ -352,28 +384,31 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
                 g.game_history[p].outcome = 0;
               } else {
                 bool is_white_turn = (p % 2 == 0);
-                g.game_history[p].outcome = (game_result == 1) ? (is_white_turn ? 1 : -1) : (is_white_turn ? -1 : 1);
+                g.game_history[p].outcome = (game_result == 1)
+                                                ? (is_white_turn ? 1 : -1)
+                                                : (is_white_turn ? -1 : 1);
               }
             }
 
-            // CRITICAL: Lock mutex before writing to the shared file
             {
               std::lock_guard<std::mutex> lock(file_mutex);
               save_game_to_binary(g.game_history, out);
-              int current_games = ++games_completed; // Increment atomic inside lock
+              int current_games = ++games_completed;
               positions_written += g.game_history.size();
 
-              std::cout << "                   Games completed: " << current_games << " / " << total_games_to_play 
-                            << " (Positions written: " << positions_written.load() << ")\r" << std::flush;
+              std::cout << "                   Games completed: "
+                        << current_games << " / " << total_games_to_play
+                        << " (Positions written: " << positions_written.load()
+                        << ")\r" << std::flush;
 
-              // Reset game logic
+              // Reset game logic (something not quite right here?)
               if (current_games + datagenbatchsize <= total_games_to_play) {
-                 g.root_pos.initialize();
-                 g.game_history.clear();
-                 g.game_hashes.clear();
-                 g.ply_count = 0;
+                g.root_pos.initialize();
+                g.game_history.clear();
+                g.game_hashes.clear();
+                g.ply_count = 0;
               } else {
-                 g.is_active = false;
+                g.is_active = false;
               }
             }
           }
@@ -386,11 +421,11 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         }
       }
 
-        if (!keep_running.load(std::memory_order_relaxed)) {
-          sync_point.arrive_and_drop();
-          break;
+      if (!keep_running.load(std::memory_order_relaxed)) {
+        sync_point.arrive_and_drop();
+        break;
       }
-      sync_point.arrive_and_wait(); // Wait before starting the next cycle
+      sync_point.arrive_and_wait();
     }
   };
 
@@ -405,5 +440,3 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
     t.join();
   }
 }
-
-

@@ -140,8 +140,7 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
           NNOutput raw_nn = nn.infer(current_pos);
           MCTSEval processed =
               parse_nn_output(raw_nn, moves, movecount, current_pos.stm);
-          value =
-              processed.qscore; // (Don't overwrite this at the bottom anymore!)
+          value = processed.qscore;
 
           U32 child_start = arena.active_nodes.fetch_add(
               movecount, std::memory_order_relaxed);
@@ -172,11 +171,12 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
     } else {
       for (int i = search_path.size() - 1; i >= 0; --i) {
         U32 idx = search_path[i];
-        if (i > 0) { // Assuming you don't add virtual visits to the root
-          arena.nodes[idx].virtual_visits.fetch_sub(1, std::memory_order_relaxed);
+        if (i > 0) {
+          arena.nodes[idx].virtual_visits.fetch_sub(1,
+                                                    std::memory_order_relaxed);
         }
       }
-      return 0; 
+      return 0;
     }
   }
 

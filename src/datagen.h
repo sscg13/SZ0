@@ -18,9 +18,9 @@ struct DatagenGame {
   Position root_pos;
   TreeArena arena;
   std::vector<U64> game_hashes;
-  
+
   // MCTS Step State
-  Position leaf_pos; 
+  Position leaf_pos;
   std::vector<U32> search_path;
   int rollouts_completed = 0;
 
@@ -29,12 +29,9 @@ struct DatagenGame {
   int ply_count = 0;
   bool is_active = true;
 
-  DatagenGame(size_t arena_size) : arena(arena_size) {
-      root_pos.initialize();
-  }
+  DatagenGame(size_t arena_size) : arena(arena_size) { root_pos.initialize(); }
 };
 
-void generate_batched_selfplay_games(NNEvaluator &nn, 
-                                     const std::string &output_prefix, 
-                                     U64 nodecount,
-                                     int total_games_to_play);
+void generate_batched_selfplay_games(NNEvaluator &nn,
+                                     const std::string &output_prefix,
+                                     U64 nodecount, int total_games_to_play);
