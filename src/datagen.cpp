@@ -221,6 +221,10 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
     std::mt19937 rng(std::random_device{}() + thread_idx);
     std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
 
+    for (int i = start_idx; i < end_idx; ++i) {
+        games[i]->reset(rng);
+    }
+
     while (true) {
 
       // ==========================================
@@ -403,10 +407,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
 
               // Reset game logic (something not quite right here?)
               if (current_games + datagenbatchsize <= total_games_to_play) {
-                g.root_pos.initialize();
-                g.game_history.clear();
-                g.game_hashes.clear();
-                g.ply_count = 0;
+                g.reset(rng);
               } else {
                 g.is_active = false;
               }

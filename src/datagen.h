@@ -30,6 +30,23 @@ struct DatagenGame {
   bool is_active = true;
 
   DatagenGame(size_t arena_size) : arena(arena_size) { root_pos.initialize(); }
+
+  void reset(std::mt19937& rng) {
+        std::uniform_int_distribution<int> dist(0, 359);
+        int seed1 = dist(rng);
+        int seed2 = dist(rng);
+        
+        std::string fen = get129600FEN(seed1, seed2);
+        root_pos.parseFEN(fen);
+        
+        // Clear all state for the new game
+        arena.clear();
+        game_hashes.clear();
+        game_history.clear();
+        ply_count = 0;
+        rollouts_completed = 0;
+        is_active = true;
+    }
 };
 
 void generate_batched_selfplay_games(NNEvaluator &nn,
