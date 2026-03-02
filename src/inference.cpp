@@ -55,71 +55,47 @@ MCTSEval parse_nn_output(const NNOutput &raw_nn, const Move *moves,
   return result;
 }
 
-std::vector<NNOutput> NNEvaluator::infer_batch(const std::vector<Position> &positions) {
-  int64_t batch_size = positions.size();
-  
-  // Return early if the queue/batch is empty
-  if (batch_size == 0) {
-    return {};
-  }
-
-  std::vector<I32> batched_pieces(batch_size * 64);
-  std::vector<I32> batched_halfmoves(batch_size);
-
-  for (int64_t b = 0; b < batch_size; ++b) {
-    const Position &pos = positions[b];
-    
-    for (int i = 0; i < 64; ++i) {
-      int perspective_square = pos.stm ? (i ^ 56) : i;
-      // Use flat indexing: (batch_index * 64) + square_index
-      batched_pieces[(b * 64) + perspective_square] = perspectivepiece(pos.pieces[i], pos.stm);
-    }
-    batched_halfmoves[b] = pos.halfmovecount;
-  }
-
-  // 3. Define the new batched shapes
-  std::array<int64_t, 2> board_shape{batch_size, 64};
-  std::array<int64_t, 1> halfmove_shape{batch_size}; // See note below if ONNX complains
-
-  // 4. Create tensors pointing to our flat vectors
-  Ort::Value board_tensor = Ort::Value::CreateTensor<int32_t>(
-      memory_info, batched_pieces.data(), batched_pieces.size(),
-      board_shape.data(), board_shape.size());
-
-  Ort::Value halfmove_tensor = Ort::Value::CreateTensor<int32_t>(
-      memory_info, batched_halfmoves.data(), batched_halfmoves.size(),
-      halfmove_shape.data(), halfmove_shape.size());
-
-  std::vector<Ort::Value> input_tensors;
-  input_tensors.push_back(std::move(board_tensor));
-  input_tensors.push_back(std::move(halfmove_tensor));
-
-  // 5. Run inference on the whole batch at once!
-  auto output_tensors = session.Run(
-      Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(),
-      input_tensors.size(), output_names.data(), output_names.size());
-
-  // 6. Extract and slice the outputs
-  std::vector<NNOutput> results(batch_size);
-  float *policy_ptr = output_tensors[0].GetTensorMutableData<float>();
-  float *value_ptr = output_tensors[1].GetTensorMutableData<float>();
-
-  for (int64_t b = 0; b < batch_size; ++b) {
-    // Copy 4096 policy floats and 3 value floats for this specific board
-    std::copy(policy_ptr + (b * 4096), policy_ptr + ((b + 1) * 4096), results[b].policy);
-    std::copy(value_ptr + (b * 3), value_ptr + ((b + 1) * 3), results[b].value);
-  }
-
-  return results;
-}
-
 NNOutput NNEvaluator::infer(const Position &pos) {
-  std::vector<Position> dummy_batch;
-  dummy_batch.push_back(pos);
-  
-  std::vector<NNOutput> batched_results = infer_batch(dummy_batch);
-  
-  return batched_results[0]; // Return the first (and only) result
+    // 1. Use stack-allocated arrays instead of std::vector to avoid heap allocation
+    int32_t board_data[64];
+    int32_t halfmove_data[1] = { static_cast<int32_t>(pos.halfmovecount) };
+
+    // 2. Fill the board data directly
+    for (int i = 0; i < 64; ++i) {
+        int perspective_square = pos.stm ? (i ^ 56) : i;
+        board_data[perspective_square] = perspectivepiece(pos.pieces[i], pos.stm);
+    }
+
+    // 3. Define fixed shapes (static const to avoid re-initialization)
+    static const int64_t board_shape[] = {1, 64};
+    static const int64_t halfmove_shape[] = {1};
+
+    // 4. Create tensors pointing to stack memory
+    // Note: We use the version of CreateTensor that doesn't own the memory
+    Ort::Value input_tensors[2] = {
+        Ort::Value::CreateTensor<int32_t>(
+            memory_info, board_data, 64, board_shape, 2),
+        Ort::Value::CreateTensor<int32_t>(
+            memory_info, halfmove_data, 1, halfmove_shape, 1)
+    };
+
+    // 5. Run inference
+    // Assuming input_names and output_names are std::vector<const char*> members
+    auto output_tensors = session.Run(
+        Ort::RunOptions{nullptr}, 
+        input_names.data(), input_tensors, 2, 
+        output_names.data(), output_names.size()
+    );
+
+    // 6. Extract results directly into the return struct
+    NNOutput result;
+    const float* policy_ptr = output_tensors[0].GetTensorData<float>();
+    const float* value_ptr = output_tensors[1].GetTensorData<float>();
+
+    std::copy(policy_ptr, policy_ptr + 4096, result.policy);
+    std::copy(value_ptr, value_ptr + 3, result.value);
+
+    return result;
 }
 
 void NNEvaluator::infer_packed(const std::vector<int32_t>& flat_pieces, 

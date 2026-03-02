@@ -83,7 +83,6 @@ public:
   }
 
   NNOutput infer(const Position &pos);
-  std::vector<NNOutput> infer_batch(const std::vector<Position> &positions);
   void infer_packed(const std::vector<int32_t>& flat_pieces, 
                     const std::vector<int32_t>& flat_halfmoves,
                     std::vector<NNOutput>& shared_results,
