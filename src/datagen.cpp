@@ -190,7 +190,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   std::atomic<bool> keep_running{true};
 
 
-  std::vector<bool> shared_needs_nn(datagenbatchsize, false);
+  std::vector<U8> shared_needs_nn(datagenbatchsize, 0);
   std::vector<NNOutput> shared_nn_results(datagenbatchsize);
 
   // Pre-allocated flat arrays for the GPU batch
@@ -212,20 +212,20 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
     std::mt19937 rng(std::random_device{}() + thread_idx); 
     std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
 
-    while (keep_running.load(std::memory_order_relaxed)) {
+    while (true) {
       
       // ==========================================
       // PHASE 1: MCTS Select (Parallelized)
       // ==========================================
       for (int i = start_idx; i < end_idx; ++i) {
-        shared_needs_nn[i] = false;
+        shared_needs_nn[i] = 0;
         DatagenGame &g = *games[i];
         if (!g.is_active) continue;
 
         if (g.rollouts_completed < nodecount) {
           bool needs_nn = select(g);
           if (needs_nn) {
-            shared_needs_nn[i] = true;
+            shared_needs_nn[i] = 1;
             
             // Lock-free atomic reservation for this board's slot in the batch
             int b_idx = current_batch_size.fetch_add(1, std::memory_order_relaxed);
@@ -240,9 +240,13 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
           }
         }
       }
-
-      sync_point.arrive_and_wait(); // Wait for all threads to finish traversing
-      if (!keep_running.load(std::memory_order_relaxed)) break;
+      
+      
+        if (!keep_running.load(std::memory_order_relaxed)) {
+          sync_point.arrive_and_drop();
+          break;
+      }
+      sync_point.arrive_and_wait();
 
       // ==========================================
       // PHASE 2: GPU Inference (Thread 0 Only)
@@ -268,17 +272,15 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         if (duration >= 1000) { // Print every 1 second
             std::cout << "TRUE NPS: " << nps << "\r" << std::flush;
             last_print = now;
-            /*if (!flush_onnx_output) {
-                Ort::AllocatorWithDefaultOptions allocator;
-                // This forces the RAM buffer to flush to the JSON file
-                auto profile_file = nn.session.EndProfilingAllocated(allocator);
-                flush_onnx_output = true;
-            }*/
         }
       }
-
+      
+      
+      if (!keep_running.load(std::memory_order_relaxed)) {
+          sync_point.arrive_and_drop();
+          break;
+      }
       sync_point.arrive_and_wait();
-      if (!keep_running.load(std::memory_order_relaxed)) break;
 
       // ==========================================
       // PHASE 3: Expand & Move Check (Parallelized)
@@ -300,11 +302,10 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             game_result = g.root_pos.stm ? 1 : -1;
             is_terminal = true;
           } else {
-            float total_child_visits = 0.0f;
+            int total_child_visits = 0;
             for (int c = 0; c < root.num_children; ++c) {
               total_child_visits += g.arena.nodes[root.first_child_idx + c].visits.load(std::memory_order_relaxed);
             }
-            if (total_child_visits == 0.0f) total_child_visits = 1.0f;
 
             TrainingPosition train_pos;
             train_pos.halfmove_clock = g.root_pos.halfmovecount;
@@ -385,6 +386,10 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         }
       }
 
+        if (!keep_running.load(std::memory_order_relaxed)) {
+          sync_point.arrive_and_drop();
+          break;
+      }
       sync_point.arrive_and_wait(); // Wait before starting the next cycle
     }
   };

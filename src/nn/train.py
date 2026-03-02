@@ -10,6 +10,15 @@ from dataloader import load_sparse_dataset
 from dataloader import SparseInMemoryDataLoader
 from architecture import ShatranjNet
 
+# Create an absolute path for your checkpoints
+ckpt_dir = os.path.abspath("./sz0_small_run1")
+options = ocp.CheckpointManagerOptions(max_to_keep=None, create=True)
+checkpoint_manager = ocp.CheckpointManager(
+    ckpt_dir, 
+    options=options, 
+    item_names=('state',)
+)
+
 def compute_loss(params, apply_fn, batch):
     # --- HYPERPARAMETERS (Tune these!) ---
     VALUE_WEIGHT = 4  # Scales up Value Loss to compete with Policy Loss
@@ -73,24 +82,19 @@ def train_step(state, batch):
 def train():
     print("Initializing ShatranjNet Training...")
     
-    # Setup PRNG Keys
+    # 1. Standard Initialization
     key = jax.random.PRNGKey(42)
     key, init_key = jax.random.split(key)
-    
-    # Instantiate Model & Optimizer
     model = ShatranjNet()
-    # Learning rate warmups/decays are added here later. We use a static LR for now.
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adamw(learning_rate=1e-4, weight_decay=1e-4)
     )
     
-    # Create Dummy Batch to initialize shapes
     dummy_boards = jnp.zeros((1, 64), dtype=jnp.int32)
     dummy_halfmoves = jnp.zeros((1,), dtype=jnp.int32)
     variables = model.init(init_key, dummy_boards, dummy_halfmoves)
     
-    # Create the TrainState
     state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=variables['params'],
@@ -98,15 +102,30 @@ def train():
     )
     
     print(f"Model parameters: {sum(x.size for x in jax.tree_util.tree_leaves(state.params)):,}")
+    
+    latest_step = checkpoint_manager.latest_step()
+    if latest_step is not None:
+        print(f"Resuming from global step {latest_step}...")
+        restored = checkpoint_manager.restore(
+            latest_step,
+            args=ocp.args.Composite(state=ocp.args.StandardRestore(state))
+        )
+        state = restored['state']
+        # The next checkpoint should be latest_step + 1
+        global_offset = latest_step + 1
+    else:
+        print("No checkpoint found. Starting fresh.")
+        global_offset = 0
+    
     print("Starting Training Loop...\n")
     
     # Load files
-    data_files = ["run0.data", "run1.data", "run2.data", "run3.data"]
+    data_files = [f"run{x}.data" for x in range(1, 6)] + [f"run{x}.data" for x in range(7, 17)]
     full_dataset = load_sparse_dataset(data_files)
     dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=128)
     
     epochs = 10
-    step = 0
+    local_step = 0
     start_time = time.time()
     
     for epoch in range(epochs):
@@ -119,18 +138,18 @@ def train():
             state, loss, p_loss, v_loss, wdl_loss, q_loss = train_step(state, batch)
             loss.block_until_ready()
 
-            step += 1
+            local_step += 1
             
-            if step % 100 == 0:
+            if local_step % 100 == 0:
                 elapsed = time.time() - start_time
-                print(f"Step {step:04d} | Total: {loss:.4f} "
+                print(f"Step {local_step:04d} | Total: {loss:.4f} "
                       f"[Pol: {p_loss:.4f} | Val: {v_loss:.4f} (WDL: {wdl_loss:.4f}, Q: {q_loss:.4f})] "
                       f"| Time: {elapsed:.2f}s")
                 start_time = time.time()
 
-        print(f"Saving checkpoint for epoch {epoch}...")
+        print(f"Saving checkpoint for epoch ({global_offset} +) {epoch}...")
         checkpoint_manager.save(
-            step=epoch,
+            step=global_offset + epoch,
             args=ocp.args.Composite(
                 state=ocp.args.StandardSave(state)
             )
@@ -140,17 +159,6 @@ def train():
 
     print("\nTraining complete!")
     return state
-
-# Create an absolute path for your checkpoints
-ckpt_dir = os.path.abspath("./sz0_small_run1")
-# Configure the manager (e.g., only keep the 5 most recent checkpoints)
-options = ocp.CheckpointManagerOptions(max_to_keep=5, create=True)
-# Initialize the manager using the modern API
-checkpoint_manager = ocp.CheckpointManager(
-    ckpt_dir, 
-    options=options, 
-    item_names=('state',)
-)
 
 if __name__ == "__main__":
     final_state = train()
