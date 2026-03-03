@@ -222,7 +222,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
     std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
 
     for (int i = start_idx; i < end_idx; ++i) {
-        games[i]->reset(rng);
+      games[i]->reset(rng);
     }
 
     while (true) {
@@ -340,9 +340,28 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
                 root.value_sum /
                 std::max(1, root.visits.load(std::memory_order_relaxed));
 
+            float temperature = (g.ply_count < 30) ? 1.0f : 0.0f;
+
             float random_choice = prob_dist(rng);
             float cumulative_prob = 0.0f;
             Move selected_move = g.arena.nodes[root.first_child_idx].move;
+
+            int best_child_idx = 0;
+            int max_visits = -1;
+
+            for (int c = 0; c < root.num_children; ++c) {
+              int v = g.arena.nodes[root.first_child_idx + c].visits.load(
+                  std::memory_order_relaxed);
+              if (v > max_visits) {
+                max_visits = v;
+                best_child_idx = c;
+              }
+            }
+
+            if (temperature == 0.0f) {
+              selected_move =
+                  g.arena.nodes[root.first_child_idx + best_child_idx].move;
+            }
 
             for (int c = 0; c < root.num_children; ++c) {
               Node &child = g.arena.nodes[root.first_child_idx + c];
@@ -350,15 +369,20 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
 
               int from_sq = g.root_pos.stm ? (m.from() ^ 56) : m.from();
               int to_sq = g.root_pos.stm ? (m.to() ^ 56) : m.to();
-
               train_pos.move_indices[c] = (from_sq * 64) + to_sq;
-              float visit_prob = static_cast<float>(child.visits.load(std::memory_order_relaxed)) / total_child_visits;
+
+              float visit_prob = static_cast<float>(child.visits.load(
+                                     std::memory_order_relaxed)) /
+                                 total_child_visits;
               train_pos.move_probabilities[c] = visit_prob;
 
-              cumulative_prob += visit_prob;
-              if (random_choice <= cumulative_prob && random_choice != -1.0f) {
-                selected_move = m;
-                random_choice = -1.0f;
+              if (temperature > 0.0f) {
+                cumulative_prob += visit_prob;
+                if (random_choice <= cumulative_prob &&
+                    random_choice != -1.0f) {
+                  selected_move = m;
+                  random_choice = -1.0f;
+                }
               }
             }
 
