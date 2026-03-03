@@ -138,6 +138,40 @@ void uci() {
         threadcount = std::stoi(token);
       }
     }
+    if (token == "eval") {
+      Move moves[maxmoves];
+      int movecount = current_pos.generatemoves(moves);
+      NNOutput raw_nn = nn.infer(current_pos);
+      MCTSEval processed = parse_nn_output(raw_nn, moves, movecount, current_pos.stm);
+
+      std::cout << "Value (STM): " << processed.qscore << "\n";
+      float max_v_logit =
+            std::max({raw_nn.value[0], raw_nn.value[1], raw_nn.value[2]});
+        float exp_w = std::exp(raw_nn.value[0] - max_v_logit);
+        float exp_d = std::exp(raw_nn.value[1] - max_v_logit);
+        float exp_l = std::exp(raw_nn.value[2] - max_v_logit);
+        float sum_v = exp_w + exp_d + exp_l;
+
+        float prob_win = exp_w / sum_v;
+        float prob_draw = exp_d / sum_v;
+        float prob_loss = exp_l / sum_v;
+      std::cout << "W: " << prob_win << " D: " << prob_draw << " L: " << prob_loss << "\n";
+      struct MovePrior { Move m; float p; };
+      std::vector<MovePrior> ranked_moves;
+      for (int i = 0; i < movecount; i++) {
+          ranked_moves.push_back({moves[i], processed.priors[i]});
+      }
+
+      std::sort(ranked_moves.begin(), ranked_moves.end(), [](const MovePrior& a, const MovePrior& b) {
+          return a.p > b.p;
+      });
+
+      std::cout << "Policy:\n";
+      for (int i = 0; i < movecount; i++) {
+          std::cout << "  " << i + 1 << ". " << algebraic(ranked_moves[i].m) 
+                    << " | Prior: " << ranked_moves[i].p * 100.0f << "%\n";
+      }
+    }
   }
 }
 
