@@ -120,11 +120,11 @@ def train():
     print("Starting Training Loop...\n")
     
     # Load files
-    data_files = [f"run{x}.data" for x in range(1, 6)] + [f"run{x}.data" for x in range(7, 17)]
+    data_files = [f"run{x}.data" for x in range(71)]
     full_dataset = load_sparse_dataset(data_files)
-    dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=128)
+    dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=284)
     
-    epochs = 10
+    epochs = 5
     local_step = 0
     start_time = time.time()
     

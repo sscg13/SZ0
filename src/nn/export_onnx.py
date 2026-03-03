@@ -72,8 +72,8 @@ def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batc
 
 if __name__ == "__main__":
     input_base_dir = os.path.abspath("./sz0_small_run1")
-    step = 19 
-    output_filename = "sz0_small_epoch19.onnx"
+    step = 44
+    output_filename = "sz0_small_epoch44.onnx"
     batch_size = 1
     
     print(f"Starting conversion for step {step} in {input_base_dir}...")
