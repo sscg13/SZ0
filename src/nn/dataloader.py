@@ -42,6 +42,17 @@ def load_sparse_dataset(filepaths):
                 sparse_pis.append((move_indices, move_probs))
                 
     print(f"Finished loading {len(boards)} positions sparsely!")
+    
+    if zs:
+        z_array = np.array(zs, dtype=np.float32)
+        unique_zs, counts = np.unique(z_array, return_counts=True)
+        total_positions = len(zs)
+        
+        print("\n--- WDL (Z) Distribution ---")
+        for z_val, count in zip(unique_zs, counts):
+            pct = (count / total_positions) * 100
+            print(f"Z = {z_val:>5.2f} : {count:>8} positions ({pct:>5.1f}%)")
+        print("----------------------------\n")
                 
     return {
         "boards": np.array(boards, dtype=np.int32),

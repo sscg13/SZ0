@@ -21,7 +21,7 @@ checkpoint_manager = ocp.CheckpointManager(
 
 def compute_loss(params, apply_fn, batch):
     # --- HYPERPARAMETERS (Tune these!) ---
-    VALUE_WEIGHT = 4  # Scales up Value Loss to compete with Policy Loss
+    VALUE_WEIGHT = 48  # Scales up Value Loss to compete with Policy Loss
     Q_WEIGHT = 1      # How much to care about MCTS Q vs Actual Game Outcome (WDL)
     # -------------------------------------
 
@@ -54,7 +54,8 @@ def compute_loss(params, apply_fn, batch):
 
     # 4. Combine and Balance
     # Blend the WDL cross-entropy with the Q MSE
-    combined_value_loss = wdl_loss + (Q_WEIGHT * q_mse_loss)
+    #combined_value_loss = wdl_loss + (Q_WEIGHT * q_mse_loss)
+    combined_value_loss = q_mse_loss
     
     # Scale up the value loss so it doesn't get drowned out by the policy loss
     total_loss = policy_loss + (VALUE_WEIGHT * combined_value_loss)
@@ -120,7 +121,7 @@ def train():
     print("Starting Training Loop...\n")
     
     # Load files
-    data_files = [f"run{x}.data" for x in range(71)]
+    data_files = [f"run{x}.data" for x in range(61)]
     full_dataset = load_sparse_dataset(data_files)
     dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=284)
     

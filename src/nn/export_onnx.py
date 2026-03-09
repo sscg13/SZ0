@@ -49,7 +49,7 @@ def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batc
         jax.ShapeDtypeStruct(shape=(batch_size, 64), dtype=jnp.int32),
         jax.ShapeDtypeStruct(shape=(batch_size,), dtype=jnp.int32)
     ]
-    print("3. Exporting directly to ONNX (Batch Size: {batch_size})...")
+    print("3. Exporting to ONNX...")
     to_onnx(
         forward_pass,
         input_signatures, 
@@ -66,15 +66,16 @@ def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batc
         hidden_size=256    # Set to your d_model (looks like 256 in your Netron pic)
     )
     
+    optimized.convert_float_to_float16()
     optimized.save_model_to_file(output_onnx_path)
     print(f"Success! ONNX model saved to: {output_onnx_path}")
 
 
 if __name__ == "__main__":
     input_base_dir = os.path.abspath("./sz0_small_run1")
-    step = 44
-    output_filename = "sz0_small_epoch44.onnx"
-    batch_size = 1
+    step = 64
+    output_filename = "sz0_small_batched.onnx"
+    batch_size = 284
     
     print(f"Starting conversion for step {step} in {input_base_dir}...")
     export_jax_to_onnx(input_base_dir, step, output_filename, batch_size)
