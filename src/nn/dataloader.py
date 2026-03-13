@@ -1,8 +1,8 @@
 import struct
 import numpy as np
+import psutil
 import os
 
-# Your exact 71-byte C++ struct layout
 HEADER_FORMAT = '<f B B b 64B'
 HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 
@@ -10,10 +10,14 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 ACTION_SPACE_SIZE = 4096 
 
 def load_sparse_dataset(filepaths):
-    boards, zs, qs, halfmoves = [], [], [], []
-    sparse_pis = [] # Will hold tuples of (move_indices, move_probs)
+    boards, move_counts, zs, qs, halfmoves = [], [], [], [], []
     
-    print(f"Loading {len(filepaths)} files into memory (Sparse Mode)...")
+    raw_indices = bytearray()
+    raw_probs = bytearray()
+    
+    print(f"Loading {len(filepaths)} files into memory (Memory Optimized)...")
+    
+    files_loaded = 0
     
     for filepath in filepaths:
         if not os.path.exists(filepath):
@@ -35,13 +39,26 @@ def load_sparse_dataset(filepaths):
                 indices_bytes = f.read(num_moves * 2)
                 probs_bytes = f.read(num_moves * 4)   
                 
-                move_indices = struct.unpack(f'<{num_moves}H', indices_bytes)
-                move_probs = struct.unpack(f'<{num_moves}f', probs_bytes)
-                
-                # Store the sparse data exactly as it comes from C++
-                sparse_pis.append((move_indices, move_probs))
+                move_counts.append(num_moves)
+                raw_indices.extend(indices_bytes)
+                raw_probs.extend(probs_bytes)
+        
+        files_loaded += 1
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info().rss / 1e9  # Convert bytes to GB
+        print(f"Loaded file {files_loaded}/{len(filepaths)} | Current RAM: {mem_info:.2f} GB", flush=True)
                 
     print(f"Finished loading {len(boards)} positions sparsely!")
+    
+    # 3. Convert bytearrays directly to 1D NumPy arrays
+    # Assuming standard little-endian architecture (which x86/GPUs use natively)
+    flat_indices = np.frombuffer(raw_indices, dtype=np.uint16)
+    flat_probs = np.frombuffer(raw_probs, dtype=np.float32)
+    
+    # 4. Create an offsets array for O(1) lookups
+    counts_np = np.array(move_counts, dtype=np.int32)
+    offsets = np.zeros(len(counts_np) + 1, dtype=np.int32)
+    offsets[1:] = np.cumsum(counts_np)
     
     if zs:
         z_array = np.array(zs, dtype=np.float32)
@@ -59,7 +76,10 @@ def load_sparse_dataset(filepaths):
         "halfmoves": np.array(halfmoves, dtype=np.float32).reshape(-1, 1),
         "target_z": np.array(zs, dtype=np.float32).reshape(-1, 1),
         "target_q": np.array(qs, dtype=np.float32).reshape(-1, 1),
-        "sparse_pis": sparse_pis # Note: This remains a regular Python list
+        
+        "pi_indices": flat_indices,
+        "pi_probs": flat_probs,
+        "pi_offsets": offsets 
     }
 
 class SparseInMemoryDataLoader:
@@ -82,14 +102,18 @@ class SparseInMemoryDataLoader:
             dense_pi = np.zeros((self.batch_size, 4096), dtype=np.float32)
             
             for batch_row, raw_idx in enumerate(batch_idx):
-                m_indices, m_probs = self.data['sparse_pis'][raw_idx]
+                # O(1) lookup of where this position's moves start and end
+                start_idx = self.data['pi_offsets'][raw_idx]
+                end_idx = self.data['pi_offsets'][raw_idx + 1]
                 
-                # Scatter probabilities into the dense array
-                for move_id, prob in zip(m_indices, m_probs):
-                    if move_id < 4096:
-                        dense_pi[batch_row, move_id] = prob
+                # Slice the raw flat arrays
+                m_indices = self.data['pi_indices'][start_idx:end_idx]
+                m_probs = self.data['pi_probs'][start_idx:end_idx]
                 
-            # 3. Yield the perfectly formatted batch
+                # Vectorized scatter (Replaces the slow Python zip loop)
+                valid_mask = m_indices < 4096
+                dense_pi[batch_row, m_indices[valid_mask]] = m_probs[valid_mask]
+                
             yield {
                 'boards': self.data['boards'][batch_idx],
                 'halfmoves': self.data['halfmoves'][batch_idx],

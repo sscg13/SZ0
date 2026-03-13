@@ -5,6 +5,7 @@ from flax.training import train_state
 import time
 import orbax.checkpoint as ocp
 import os
+import glob
 
 from dataloader import load_sparse_dataset
 from dataloader import SparseInMemoryDataLoader
@@ -121,11 +122,11 @@ def train():
     print("Starting Training Loop...\n")
     
     # Load files
-    data_files = [f"run{x}.data" for x in range(61)]
+    data_files = glob.glob("*.data")
     full_dataset = load_sparse_dataset(data_files)
     dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=284)
     
-    epochs = 5
+    epochs = 2
     local_step = 0
     start_time = time.time()
     

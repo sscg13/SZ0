@@ -11,7 +11,7 @@ from onnxruntime.transformers.optimizer import optimize_model
 from architecture import ShatranjNet 
 
 
-def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batch_size):
+def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batch_size, convert_fp16):
     print("1. Loading Orbax Checkpoint...")
     model = ShatranjNet()
     
@@ -61,21 +61,45 @@ def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batc
     print("4. Optimizing...")
     optimized = optimize_model(
         f"temp_{output_onnx_path}",
-        model_type='bert', # 'bert' is the generic trigger for Encoder fusions
-        num_heads=8,       # Set to your ShatranjNet head count
-        hidden_size=256    # Set to your d_model (looks like 256 in your Netron pic)
+        model_type='bert', # generic transformer
+        num_heads=8,
+        hidden_size=256
     )
     
-    optimized.convert_float_to_float16()
+    if (convert_fp16):
+        optimized.convert_float_to_float16()
+        
     optimized.save_model_to_file(output_onnx_path)
     print(f"Success! ONNX model saved to: {output_onnx_path}")
 
+def get_latest_step(checkpoint_dir):
+    steps = ocp.utils.checkpoint_steps(checkpoint_dir)
+    if not steps:
+        raise ValueError(f"No checkpoints found in {checkpoint_dir}")
+    return max(steps)
 
 if __name__ == "__main__":
     input_base_dir = os.path.abspath("./sz0_small_run1")
-    step = 64
-    output_filename = "sz0_small_batched.onnx"
-    batch_size = 284
     
-    print(f"Starting conversion for step {step} in {input_base_dir}...")
-    export_jax_to_onnx(input_base_dir, step, output_filename, batch_size)
+    try:
+        latest_step = get_latest_step(input_base_dir)
+        print(f"Detected latest step: {latest_step}")
+
+        conversions = [
+            {"batch": 1, "name": f"sz0_small_epoch{latest_step}.onnx", "fp16": False},
+            {"batch": 284, "name": "sz0_small_batched.onnx", "fp16": True}
+        ]
+
+        for task in conversions:
+            print(f"--- Starting conversion: Batch Size {task['batch']} ---")
+            export_jax_to_onnx(
+                input_base_dir, 
+                latest_step, 
+                task["name"], 
+                task["batch"],
+                task["fp16"]
+            )
+            print(f"Successfully exported to {task['name']}")
+
+    except Exception as e:
+        print(f"Error during conversion process: {e}")
