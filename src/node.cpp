@@ -25,8 +25,13 @@ void TreeArena::resize(int megabytes) {
 U32 select_best_puct(const TreeArena &arena, U32 node_idx) {
   const Node &parent = arena.nodes[node_idx];
   const float c_puct = 2.0f;
-  float sqrt_parent_visits = std::sqrt(static_cast<float>(
-      std::max(1, parent.visits.load(std::memory_order_relaxed))));
+
+  int parent_visits = parent.visits.load(std::memory_order_relaxed);
+  float sqrt_parent_visits = std::sqrt(static_cast<float>(std::max(1, parent_visits)));
+
+  float parent_q = (parent_visits > 0) 
+                       ? (parent.value_sum / static_cast<float>(parent_visits)) 
+                       : 0.0f;
 
   U32 best_idx = parent.first_child_idx;
   float best_score = -std::numeric_limits<float>::infinity();
@@ -39,7 +44,7 @@ U32 select_best_puct(const TreeArena &arena, U32 node_idx) {
     int effective_visits = real_visits + virtual_visits;
     float q_value = (real_visits > 0)
                         ? (-child.value_sum / static_cast<float>(real_visits))
-                        : 0.0f;
+                        : parent_q;
     float u_value =
         c_puct * child.prior * (sqrt_parent_visits / (1.0f + effective_visits));
     float score = q_value + u_value;
