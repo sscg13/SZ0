@@ -340,7 +340,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
                 root.value_sum /
                 std::max(1, root.visits.load(std::memory_order_relaxed));
 
-            //float temperature = (g.ply_count < 30) ? 1.0f : 0.0f;
+            // float temperature = (g.ply_count < 30) ? 1.0f : 0.0f;
             float temperature = 1.0f;
 
             float random_choice = prob_dist(rng);

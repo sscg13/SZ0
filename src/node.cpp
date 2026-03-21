@@ -27,10 +27,11 @@ U32 select_best_puct(const TreeArena &arena, U32 node_idx) {
   const float c_puct = 2.0f;
 
   int parent_visits = parent.visits.load(std::memory_order_relaxed);
-  float sqrt_parent_visits = std::sqrt(static_cast<float>(std::max(1, parent_visits)));
+  float sqrt_parent_visits =
+      std::sqrt(static_cast<float>(std::max(1, parent_visits)));
 
-  float parent_q = (parent_visits > 0) 
-                       ? (parent.value_sum / static_cast<float>(parent_visits)) 
+  float parent_q = (parent_visits > 0)
+                       ? (parent.value_sum / static_cast<float>(parent_visits))
                        : 0.0f;
 
   U32 best_idx = parent.first_child_idx;
