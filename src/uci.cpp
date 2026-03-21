@@ -33,15 +33,15 @@ void uci() {
       break;
     }
     if (token == "uci") {
-      std::cout << "id name Shatranj Zer0\n"
-                << "id author sscg13\n"
-                << "option name UCI_Variant type combo default shatranj var "
-                   "shatranj\n"
-                << "option name Threads type spin default 1 min 1 max 16\n"
-                << "option name Hash type spin default 72 min 1 max 32768\n"
-                << "option name WeightsFile type string default "
-                << default_weights << "\n"
-                << "uciok\n";
+      std::cout
+          << "id name Shatranj Zer0\n"
+          << "id author sscg13\n"
+          << "option name UCI_Variant type combo default shatranj var "
+             "shatranj\n"
+          << "option name Threads type spin default 1 min 1 max 16\n"
+          << "option name Hash type spin default 72 min 1 max 32768\n"
+          << "option name WeightsFile type string default <autodiscover>\n"
+          << "uciok\n";
     }
     if (token == "isready") {
       std::cout << "readyok\n";
@@ -142,7 +142,9 @@ void uci() {
       if (token == "WeightsFile") {
         tokens >> token;
         tokens >> token;
-        reload_network(token);
+        if (token != "<autodiscover>") {
+          reload_network(token);
+        }
       }
     }
     if (token == "eval") {
