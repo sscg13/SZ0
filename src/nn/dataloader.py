@@ -10,8 +10,9 @@ HEADER_SIZE = struct.calcsize(HEADER_FORMAT)
 ACTION_SPACE_SIZE = 4096 
 
 def load_sparse_dataset(filepaths):
-    boards, move_counts, zs, qs, halfmoves = [], [], [], [], []
+    move_counts, zs, qs, halfmoves = [], [], [], []
     
+    raw_boards = bytearray()
     raw_indices = bytearray()
     raw_probs = bytearray()
     
@@ -29,17 +30,20 @@ def load_sparse_dataset(filepaths):
                 if len(header_bytes) < HEADER_SIZE:
                     break
                 
-                unpacked = struct.unpack(HEADER_FORMAT, header_bytes)
-                qs.append(unpacked[0])
-                num_moves = unpacked[1]
-                halfmoves.append(unpacked[2])
-                zs.append(unpacked[3])
-                boards.append(unpacked[4:68])
+                # unpack_from lets us grab just the first 4 variables without parsing the 64 board bytes into Python ints
+                q, num_moves, halfmove, z = struct.unpack_from('<f B B b', header_bytes)
+                
+                qs.append(q)
+                halfmoves.append(halfmove)
+                zs.append(z)
+                move_counts.append(num_moves)
+                
+                # The board starts at byte 7 (4 for float + 1 + 1 + 1 for the 3 chars)
+                raw_boards.extend(header_bytes[7:71])
                 
                 indices_bytes = f.read(num_moves * 2)
                 probs_bytes = f.read(num_moves * 4)   
                 
-                move_counts.append(num_moves)
                 raw_indices.extend(indices_bytes)
                 raw_probs.extend(probs_bytes)
         
@@ -48,10 +52,11 @@ def load_sparse_dataset(filepaths):
         mem_info = process.memory_info().rss / 1e9  # Convert bytes to GB
         print(f"Loaded file {files_loaded}/{len(filepaths)} | Current RAM: {mem_info:.2f} GB", flush=True)
                 
-    print(f"Finished loading {len(boards)} positions sparsely!")
+    print(f"Finished loading {len(halfmoves)} positions sparsely!")
     
     # 3. Convert bytearrays directly to 1D NumPy arrays
     # Assuming standard little-endian architecture (which x86/GPUs use natively)
+    flat_boards = np.frombuffer(raw_boards, dtype=np.uint8).reshape(-1, 64)
     flat_indices = np.frombuffer(raw_indices, dtype=np.uint16)
     flat_probs = np.frombuffer(raw_probs, dtype=np.float32)
     
@@ -72,7 +77,7 @@ def load_sparse_dataset(filepaths):
         print("----------------------------\n")
                 
     return {
-        "boards": np.array(boards, dtype=np.int32),
+        "boards": flat_boards,
         "halfmoves": np.array(halfmoves, dtype=np.float32).reshape(-1, 1),
         "target_z": np.array(zs, dtype=np.float32).reshape(-1, 1),
         "target_q": np.array(qs, dtype=np.float32).reshape(-1, 1),
@@ -83,7 +88,7 @@ def load_sparse_dataset(filepaths):
     }
 
 class SparseInMemoryDataLoader:
-    def __init__(self, dataset_dict, batch_size=512):
+    def __init__(self, dataset_dict, batch_size=284):
         self.data = dataset_dict
         self.batch_size = batch_size
         self.total_samples = self.data['boards'].shape[0]
@@ -91,6 +96,7 @@ class SparseInMemoryDataLoader:
     def get_batches(self):
         # 1. Global permutation for the epoch
         indices = np.random.permutation(self.total_samples)
+        square_offsets = np.arange(64, dtype=np.int32) * 13
         
         for i in range(0, self.total_samples, self.batch_size):
             batch_idx = indices[i : i + self.batch_size]
@@ -114,8 +120,11 @@ class SparseInMemoryDataLoader:
                 valid_mask = m_indices < 4096
                 dense_pi[batch_row, m_indices[valid_mask]] = m_probs[valid_mask]
                 
+            raw_boards = self.data['boards'][batch_idx].astype(np.int32)
+            psq_boards = raw_boards + square_offsets
+            
             yield {
-                'boards': self.data['boards'][batch_idx],
+                'boards': psq_boards,
                 'halfmoves': self.data['halfmoves'][batch_idx],
                 'target_z': self.data['target_z'][batch_idx],
                 'target_q': self.data['target_q'][batch_idx],

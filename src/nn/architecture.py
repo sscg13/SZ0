@@ -11,9 +11,32 @@ class ShatranjBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        b, seq_len, _ = x.shape
+        head_dim = self.d_model // self.num_heads
+        
         # Phase A: Pre-LN Self Attention
         attn_input = nn.LayerNorm()(x)
-        attn_out = nn.SelfAttention(num_heads=self.num_heads, qkv_features=self.d_model)(attn_input)
+        
+        q = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
+        k = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 3, 1))
+        v = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
+
+        logits = jnp.matmul(q, k) / jnp.sqrt(head_dim)
+
+        # Broadcastable Spatial Bias: (1, 8, 64, 64)
+        spatial_bias = self.param(
+            'spatial_bias', 
+            nn.initializers.normal(stddev=0.02), 
+            (1, self.num_heads, seq_len, seq_len)
+        )
+        logits = logits + spatial_bias
+
+        attn_weights = nn.softmax(logits, axis=-1)
+        attn_out = jnp.matmul(attn_weights, v)
+
+        attn_out = attn_out.transpose((0, 2, 1, 3)).reshape((b, seq_len, self.d_model))
+        attn_out = nn.Dense(self.d_model)(attn_out)
+        
         x = x + attn_out
 
         # Phase B: Pre-LN Feed Forward (MLP)
@@ -30,7 +53,7 @@ class ShatranjNet(nn.Module):
     d_model: int = 256
     num_heads: int = 8
     d_ff: int = 256
-    vocab_size: int = 13 
+    vocab_size: int = 13 * 64
     max_halfmoves: int = 140
 
     @nn.compact
@@ -40,9 +63,7 @@ class ShatranjNet(nn.Module):
         safe_halfmove_token = jnp.clip(halfmove_token, 0, self.max_halfmoves - 1)
 
         # Embeddings & Setup (using the safe tokens)
-        x = nn.Embed(num_embeddings=self.vocab_size, features=self.d_model)(safe_board_tokens) 
-        pos_emb = self.param('pos_emb', nn.initializers.normal(stddev=0.02), (64, self.d_model))
-        x = x + pos_emb
+        x = nn.Embed(num_embeddings=self.vocab_size, features=self.d_model)(safe_board_tokens)
 
         g_emb = nn.Embed(num_embeddings=self.max_halfmoves, features=self.d_model)(safe_halfmove_token) 
         x = x + jnp.expand_dims(g_emb, axis=-2) 
@@ -53,16 +74,19 @@ class ShatranjNet(nn.Module):
             
         x = nn.LayerNorm()(x)
 
-        # The Value Head (WDL)
-        v = jnp.mean(x, axis=-2) 
+        # Value Head
+        v = nn.Dense(16)(x)
+        v = nn.relu(v) 
+        v = v.reshape((v.shape[0], -1)) 
         v = nn.Dense(32)(v)
         v = nn.relu(v)
-        value_logits = nn.Dense(3)(v) 
+        value_logits = nn.Dense(3)(v)
 
-        # The Policy Head (Dot-Product)
+        # Policy Head (Dot-Product)
         p_from = nn.Dense(64)(x) 
         p_to = nn.Dense(64)(x)   
-        policy_logits = jnp.einsum('bid,bjd->bij', p_from, p_to) / 8.0
+        p_to_transposed = jnp.swapaxes(p_to, -1, -2)
+        policy_logits = jnp.matmul(p_from, p_to_transposed) / 8.0
 
         return policy_logits, value_logits
 
@@ -79,8 +103,8 @@ def main():
 
     # B. Generate Dummy Data
     batch_size = 8
-    # Random integers between 0 and 12 for the 64 squares
-    dummy_boards = jax.random.randint(key_board, (batch_size, 64), minval=0, maxval=13)
+    # Random integers between 0 and 831 for the 64 squares
+    dummy_boards = jax.random.randint(key_board, (batch_size, 64), minval=0, maxval=831)
     # Random integers between 0 and 100 for the halfmove clock
     dummy_halfmoves = jax.random.randint(key_halfmove, (batch_size,), minval=0, maxval=139)
 

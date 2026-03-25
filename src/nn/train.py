@@ -1,3 +1,4 @@
+import argparse
 import jax
 import jax.numpy as jnp
 import optax
@@ -11,19 +12,10 @@ from dataloader import load_sparse_dataset
 from dataloader import SparseInMemoryDataLoader
 from architecture import ShatranjNet
 
-# Create an absolute path for your checkpoints
-ckpt_dir = os.path.abspath("./sz0_small_run1")
-options = ocp.CheckpointManagerOptions(max_to_keep=None, create=True)
-checkpoint_manager = ocp.CheckpointManager(
-    ckpt_dir, 
-    options=options, 
-    item_names=('state',)
-)
-
 def compute_loss(params, apply_fn, batch):
     # --- HYPERPARAMETERS (Tune these!) ---
-    VALUE_WEIGHT = 48  # Scales up Value Loss to compete with Policy Loss
-    Q_WEIGHT = 1      # How much to care about MCTS Q vs Actual Game Outcome (WDL)
+    VALUE_WEIGHT = 1  # Scales up Value Loss to compete with Policy Loss
+    Q_WEIGHT = 48      # How much to care about MCTS Q vs Actual Game Outcome (WDL)
     # -------------------------------------
 
     halfmoves = batch['halfmoves'].squeeze(-1).astype(jnp.int32)
@@ -55,8 +47,8 @@ def compute_loss(params, apply_fn, batch):
 
     # 4. Combine and Balance
     # Blend the WDL cross-entropy with the Q MSE
-    #combined_value_loss = wdl_loss + (Q_WEIGHT * q_mse_loss)
-    combined_value_loss = q_mse_loss
+    combined_value_loss = wdl_loss + (Q_WEIGHT * q_mse_loss)
+    #combined_value_loss = q_mse_loss
     
     # Scale up the value loss so it doesn't get drowned out by the policy loss
     total_loss = policy_loss + (VALUE_WEIGHT * combined_value_loss)
@@ -81,7 +73,7 @@ def train_step(state, batch):
     return state, loss, p_loss, v_loss, wdl_loss, q_loss
 
 # --- 3. The Main Training Engine ---
-def train():
+def train(checkpoint_manager):
     print("Initializing ShatranjNet Training...")
     
     # 1. Standard Initialization
@@ -126,7 +118,7 @@ def train():
     full_dataset = load_sparse_dataset(data_files)
     dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=284)
     
-    epochs = 2
+    epochs = 1
     local_step = 0
     start_time = time.time()
     
@@ -163,4 +155,25 @@ def train():
     return state
 
 if __name__ == "__main__":
-    final_state = train()
+    parser = argparse.ArgumentParser(description="Train Shatranj Zer0.")
+    # Positional argument that defaults to your current hardcoded path
+    parser.add_argument(
+        "run_dir", 
+        nargs="?", 
+        default="./sz0_test_value", 
+        help="Path to the checkpoint directory for this training run (default: ./sz0_test_value)"
+    )
+    args = parser.parse_args()
+
+    # Create an absolute path for your checkpoints using the argument
+    ckpt_dir = os.path.abspath(args.run_dir)
+    print(f"Initializing checkpoint manager at: {ckpt_dir}")
+    
+    options = ocp.CheckpointManagerOptions(max_to_keep=None, create=True)
+    checkpoint_manager = ocp.CheckpointManager(
+        ckpt_dir, 
+        options=options, 
+        item_names=('state',)
+    )
+    
+    final_state = train(checkpoint_manager)

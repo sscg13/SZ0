@@ -251,7 +251,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             for (int sq = 0; sq < 64; ++sq) {
               int p_sq = g.leaf_pos.stm ? (sq ^ 56) : sq;
               batched_pieces[(b_idx * 64) + p_sq] =
-                  perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm);
+                  perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm) + 13 * p_sq;
             }
             batched_halfmoves[b_idx] = g.leaf_pos.halfmovecount;
           }
