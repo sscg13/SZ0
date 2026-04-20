@@ -198,7 +198,7 @@ int main(int argc, char *argv[]) {
 
   if (argc > 1 && std::string(argv[1]) == "datagen") {
     if (argc < 5) {
-      std::cerr << "Proper usage: ./(exe) datagen <game_count> "
+      std::cerr << "Proper usage: ./(exe) datagen <position_count> "
                    "<nodes> <output_file>\n";
       return 0;
     }
@@ -210,17 +210,18 @@ int main(int argc, char *argv[]) {
 
     reload_network(default_weights);
 
-    int num_games = atoi(argv[2]);
+    int num_positions = atoi(argv[2]);
     int node_limit = atoi(argv[3]);
     std::string outputfile(argv[4]);
 
     std::cout << "Starting Data Generation Engine...\n";
     std::cout << "Using weights file: " << default_weights << "\n";
     std::cout << "Nodes/Move: " << node_limit << "\n";
+    std::cout << "Position target: " << num_positions << "\n";
     std::cout << "Data Output: " << outputfile << ".data\n";
 
     NNEvaluator nn(default_weights.c_str());
-    generate_batched_selfplay_games(nn, outputfile, node_limit, num_games);
+    generate_batched_selfplay_games(nn, outputfile, node_limit, num_positions);
 
     return 0;
   } else {

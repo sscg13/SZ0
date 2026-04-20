@@ -7,11 +7,11 @@
 #include <fstream>
 #include <thread>
 
-void save_game_to_binary(const std::vector<TrainingPosition> &game_history,
-                         std::ofstream &out) {
+int save_game_to_binary(const std::vector<TrainingPosition> &game_history,
+                        std::ofstream &out) {
   if (!out) {
     std::cerr << "Error: Could not open pipe for writing.\n";
-    return;
+    return 0;
   }
 
   for (const auto &pos : game_history) {
@@ -36,6 +36,8 @@ void save_game_to_binary(const std::vector<TrainingPosition> &game_history,
                 pos.num_moves * sizeof(float));
     }
   }
+
+  return (int)game_history.size();
 }
 
 void get_canonical_tokens(const Position &pos, uint8_t tokens[64]) {
@@ -174,7 +176,7 @@ void expand(DatagenGame &game, const NNOutput &raw_nn) {
 
 void generate_batched_selfplay_games(NNEvaluator &nn,
                                      const std::string &output_prefix,
-                                     U64 nodecount, int total_games_to_play) {
+                                     U64 nodecount, int total_positions) {
   std::string filename = output_prefix + ".data";
   std::ofstream out(filename, std::ios::binary | std::ios::app);
   if (!out.is_open()) {
@@ -234,8 +236,6 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
       for (int i = start_idx; i < end_idx; ++i) {
         shared_needs_nn[i] = 0;
         DatagenGame &g = *games[i];
-        if (!g.is_active)
-          continue;
 
         if (g.rollouts_completed < nodecount) {
           bool needs_nn = select(g);
@@ -282,8 +282,8 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         // Reset the atomic batch size for the next MCTS loop
         current_batch_size.store(0, std::memory_order_relaxed);
 
-        if (games_completed.load(std::memory_order_relaxed) >=
-            total_games_to_play) {
+        if (positions_written.load(std::memory_order_relaxed) >=
+            total_positions) {
           keep_running.store(false, std::memory_order_relaxed);
         }
         auto now = std::chrono::high_resolution_clock::now();
@@ -311,8 +311,6 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
       // ==========================================
       for (int i = start_idx; i < end_idx; ++i) {
         DatagenGame &g = *games[i];
-        if (!g.is_active)
-          continue;
 
         if (shared_needs_nn[i] && g.rollouts_completed < nodecount) {
           expand(g, shared_nn_results[i]);
@@ -439,21 +437,14 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
 
             {
               std::lock_guard<std::mutex> lock(file_mutex);
-              save_game_to_binary(g.game_history, out);
+              positions_written += save_game_to_binary(g.game_history, out);
               int current_games = ++games_completed;
-              positions_written += g.game_history.size();
 
-              std::cout << "                   Games completed: "
-                        << current_games << " / " << total_games_to_play
-                        << " (Positions written: " << positions_written.load()
-                        << ")\r" << std::flush;
+              std::cout << "Positions: " << positions_written.load() << " / "
+                        << total_positions << "  Games: " << current_games
+                        << "\r" << std::flush;
 
-              // Reset game logic (something not quite right here?)
-              if (current_games + datagenbatchsize <= total_games_to_play) {
-                g.reset(rng);
-              } else {
-                g.is_active = false;
-              }
+              g.reset(rng);
             }
           }
 

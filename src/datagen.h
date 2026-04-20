@@ -27,7 +27,6 @@ struct DatagenGame {
   // Datagen History
   std::vector<TrainingPosition> game_history;
   int ply_count = 0;
-  bool is_active = true;
 
   DatagenGame(size_t arena_size) : arena(arena_size) { root_pos.initialize(); }
 
@@ -45,10 +44,9 @@ struct DatagenGame {
     game_history.clear();
     ply_count = 0;
     rollouts_completed = 0;
-    is_active = true;
   }
 };
 
 void generate_batched_selfplay_games(NNEvaluator &nn,
                                      const std::string &output_prefix,
-                                     U64 nodecount, int total_games_to_play);
+                                     U64 nodecount, int total_positions);
