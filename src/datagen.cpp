@@ -3,6 +3,7 @@
 #include "search.h"
 
 #include <barrier>
+#include <cmath>
 #include <fstream>
 #include <thread>
 
@@ -149,7 +150,7 @@ void expand(DatagenGame &game, const NNOutput &raw_nn) {
       parse_nn_output(raw_nn, moves, movecount, game.leaf_pos.stm);
   float value = processed.qscore;
 
-  U32 child_start = game.arena.active_nodes;
+  U32 child_start = game.arena.active_nodes.load(std::memory_order_relaxed);
 
   if (child_start + movecount < game.arena.max_nodes) {
     game.arena.active_nodes.fetch_add(movecount, std::memory_order_relaxed);
@@ -251,7 +252,8 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             for (int sq = 0; sq < 64; ++sq) {
               int p_sq = g.leaf_pos.stm ? (sq ^ 56) : sq;
               batched_pieces[(b_idx * 64) + p_sq] =
-                  perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm) + 13 * p_sq;
+                  perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm) +
+                  13 * p_sq;
             }
             batched_halfmoves[b_idx] = g.leaf_pos.halfmovecount;
           }
@@ -337,15 +339,15 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             get_canonical_tokens(g.root_pos, train_pos.board_tokens);
             train_pos.num_moves = root.num_children;
             train_pos.root_q =
-                root.value_sum /
+                root.value_sum.load(std::memory_order_relaxed) /
                 std::max(1, root.visits.load(std::memory_order_relaxed));
 
-            // float temperature = (g.ply_count < 30) ? 1.0f : 0.0f;
-            float temperature = 1.0f;
-
-            float random_choice = prob_dist(rng);
-            float cumulative_prob = 0.0f;
-            Move selected_move = g.arena.nodes[root.first_child_idx].move;
+            float temperature;
+            if (g.ply_count < 60) {
+              temperature = 1.0f - 0.7f * g.ply_count / 60.0f;
+            } else {
+              temperature = 0.3f;
+            }
 
             int best_child_idx = 0;
             int max_visits = -1;
@@ -359,10 +361,9 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
               }
             }
 
-            if (temperature == 0.0f) {
-              selected_move =
-                  g.arena.nodes[root.first_child_idx + best_child_idx].move;
-            }
+            // Default to greedy best move; overridden below for T > 0
+            Move selected_move =
+                g.arena.nodes[root.first_child_idx + best_child_idx].move;
 
             for (int c = 0; c < root.num_children; ++c) {
               Node &child = g.arena.nodes[root.first_child_idx + c];
@@ -376,13 +377,30 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
                                      std::memory_order_relaxed)) /
                                  total_child_visits;
               train_pos.move_probabilities[c] = visit_prob;
+            }
 
-              if (temperature > 0.0f) {
-                cumulative_prob += visit_prob;
-                if (random_choice <= cumulative_prob &&
-                    random_choice != -1.0f) {
-                  selected_move = m;
-                  random_choice = -1.0f;
+            if (temperature > 0.0f) {
+              // Normalize by max visits before exponentiation to prevent
+              // overflow: (v/v_max)^(1/T) is equivalent since v_max^(1/T)
+              // is a common factor that cancels in normalization.
+              float inv_temp = 1.0f / temperature;
+              float sum_tempered = 0.0f;
+              for (int c = 0; c < root.num_children; ++c) {
+                int v = g.arena.nodes[root.first_child_idx + c].visits.load(
+                    std::memory_order_relaxed);
+                sum_tempered +=
+                    std::pow(static_cast<float>(v) / max_visits, inv_temp);
+              }
+              float random_choice = prob_dist(rng) * sum_tempered;
+              float cumulative = 0.0f;
+              for (int c = 0; c < root.num_children; ++c) {
+                int v = g.arena.nodes[root.first_child_idx + c].visits.load(
+                    std::memory_order_relaxed);
+                cumulative +=
+                    std::pow(static_cast<float>(v) / max_visits, inv_temp);
+                if (random_choice <= cumulative) {
+                  selected_move = g.arena.nodes[root.first_child_idx + c].move;
+                  break;
                 }
               }
             }
