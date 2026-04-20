@@ -85,7 +85,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "input_dir", 
         nargs="?", 
-        default="./sz0_test_scratch", 
+        default="./sz0_run2", 
         help="Path to the model directory (default: ./sz0_test_scratch)"
     )
     args = parser.parse_args()

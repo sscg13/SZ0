@@ -106,6 +106,7 @@ class SparseInMemoryDataLoader:
                 
             # 2. On-the-fly Dense Expansion for just this batch
             dense_pi = np.zeros((self.batch_size, 4096), dtype=np.float32)
+            legal_mask = np.zeros((self.batch_size, 4096), dtype=bool)
             
             for batch_row, raw_idx in enumerate(batch_idx):
                 # O(1) lookup of where this position's moves start and end
@@ -117,8 +118,11 @@ class SparseInMemoryDataLoader:
                 m_probs = self.data['pi_probs'][start_idx:end_idx]
                 
                 # Vectorized scatter (Replaces the slow Python zip loop)
-                valid_mask = m_indices < 4096
+                valid_mask = (m_indices >= 0) & (m_indices < 4096)
+                valid_indices = m_indices[valid_mask]
+                
                 dense_pi[batch_row, m_indices[valid_mask]] = m_probs[valid_mask]
+                legal_mask[batch_row, valid_indices] = True
                 
             raw_boards = self.data['boards'][batch_idx].astype(np.int32)
             psq_boards = raw_boards + square_offsets
@@ -128,5 +132,6 @@ class SparseInMemoryDataLoader:
                 'halfmoves': self.data['halfmoves'][batch_idx],
                 'target_z': self.data['target_z'][batch_idx],
                 'target_q': self.data['target_q'][batch_idx],
-                'target_pi': dense_pi
+                'target_pi': dense_pi,
+                'legal_mask': legal_mask
             }

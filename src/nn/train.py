@@ -1,3 +1,13 @@
+import os
+
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_enable_triton_gemm=false "
+    "--xla_gpu_enable_cublaslt=true "
+    "--xla_gpu_cublas_fallback=true "
+    "--xla_gpu_enable_command_buffer="
+)
+os.environ["JAX_TRACEBACK_FILTERING"] = "off"
+
 import argparse
 import jax
 import jax.numpy as jnp
@@ -5,7 +15,6 @@ import optax
 from flax.training import train_state
 import time
 import orbax.checkpoint as ocp
-import os
 import glob
 
 from dataloader import load_sparse_dataset
@@ -24,7 +33,9 @@ def compute_loss(params, apply_fn, batch):
     # 1. Masked Policy Loss (Cross Entropy)
     batch_size = policy_logits.shape[0]
     flat_policy_logits = policy_logits.reshape((batch_size, 4096))
-    sample_policy_loss = optax.softmax_cross_entropy(flat_policy_logits, batch['target_pi'])
+    MIN_LOGIT = -1e9
+    masked_logits = jnp.where(batch['legal_mask'], flat_policy_logits, MIN_LOGIT)
+    sample_policy_loss = optax.softmax_cross_entropy(masked_logits, batch['target_pi'])
     policy_mask = (batch['target_pi'].sum(axis=-1) > 0.5).astype(jnp.float32)
     valid_positions = jnp.maximum(policy_mask.sum(), 1.0)
     policy_loss = (sample_policy_loss * policy_mask).sum() / valid_positions
@@ -99,14 +110,17 @@ def train(checkpoint_manager):
     
     latest_step = checkpoint_manager.latest_step()
     if latest_step is not None:
+        print("Weight sum BEFORE load:", jnp.sum(jax.tree_util.tree_leaves(state.params)[0]))
+    
         print(f"Resuming from global step {latest_step}...")
         restored = checkpoint_manager.restore(
             latest_step,
             args=ocp.args.Composite(state=ocp.args.StandardRestore(state))
         )
         state = restored['state']
-        # The next checkpoint should be latest_step + 1
-        global_offset = latest_step + 1
+        global_offset = latest_step
+        
+        print("Weight sum AFTER load:", jnp.sum(jax.tree_util.tree_leaves(state.params)[0]))
     else:
         print("No checkpoint found. Starting fresh.")
         global_offset = 0
@@ -118,38 +132,59 @@ def train(checkpoint_manager):
     full_dataset = load_sparse_dataset(data_files)
     dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=284)
     
-    epochs = 1
+    # --- DIAGNOSTIC CHECK ---
+    # Get one single batch to test the network BEFORE the optimizer touches it
+    test_iterator = dataloader.get_batches()
+    test_batch = next(test_iterator)
+    
+    # Check the data integrity
+    print("--- DATA INTEGRITY CHECK ---")
+    print(f"Boards shape: {test_batch['boards'].shape}, Sum: {test_batch['boards'].sum()}")
+    print(f"Target PI shape: {test_batch['target_pi'].shape}, Sum: {test_batch['target_pi'].sum()}")
+    print(f"Target Z shape: {test_batch['target_z'].shape}, Sum: {test_batch['target_z'].sum()}")
+    
+    # Check the true checkpoint loss
+    init_loss, (init_p, init_v, init_wdl, init_q) = compute_loss(state.params, state.apply_fn, test_batch)
+    print("\n--- PRE-TRAIN LOSS CHECK ---")
+    print(f"True Checkpoint Loss: {init_loss:.4f} [Pol: {init_p:.4f} | Val: {init_v:.4f} (WDL: {init_wdl:.4f}, Q: {init_q:.4f})]")
+    print("----------------------------\n")
+    
+    # Reset dataloader so we don't skip this batch
+    dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=284)
+    
+    batches = 300000
     local_step = 0
     start_time = time.time()
-    
-    for epoch in range(epochs):
         
-        for batch in dataloader.get_batches():
-            if jnp.isnan(batch['target_pi']).any() or jnp.isnan(batch['target_z']).any():
-                print(f"CRITICAL: NaN found in data at step {step}!")
-                break
+    for batch in dataloader.get_batches():
+        if jnp.isnan(batch['target_pi']).any() or jnp.isnan(batch['target_z']).any():
+            print(f"CRITICAL: NaN found in data at step {local_step}!")
+            break
 
-            state, loss, p_loss, v_loss, wdl_loss, q_loss = train_step(state, batch)
-            loss.block_until_ready()
+        state, loss, p_loss, v_loss, wdl_loss, q_loss = train_step(state, batch)
+        loss.block_until_ready()
 
-            local_step += 1
-            
-            if local_step % 100 == 0:
-                elapsed = time.time() - start_time
-                print(f"Step {local_step:04d} | Total: {loss:.4f} "
-                      f"[Pol: {p_loss:.4f} | Val: {v_loss:.4f} (WDL: {wdl_loss:.4f}, Q: {q_loss:.4f})] "
-                      f"| Time: {elapsed:.2f}s")
-                start_time = time.time()
+        local_step += 1
+        
+        if local_step % 100 == 0:
+            elapsed = time.time() - start_time
+            print(f"Step {local_step:04d} | Total: {loss:.4f} "
+                  f"[Pol: {p_loss:.4f} | Val: {v_loss:.4f} (WDL: {wdl_loss:.4f}, Q: {q_loss:.4f})] "
+                  f"| Time: {elapsed:.2f}s")
+            start_time = time.time()
+        
+        if local_step == batches:
+            break
 
-        print(f"Saving checkpoint for epoch ({global_offset} +) {epoch}...")
-        checkpoint_manager.save(
-            step=global_offset + epoch,
-            args=ocp.args.Composite(
-                state=ocp.args.StandardSave(state)
-            )
+    print(f"Saving checkpoint for epoch {global_offset + 1}...")
+    checkpoint_manager.save(
+        step=global_offset + 1,
+        args=ocp.args.Composite(
+            state=ocp.args.StandardSave(state)
         )
+    )
 
-        checkpoint_manager.wait_until_finished()
+    checkpoint_manager.wait_until_finished()
 
     print("\nTraining complete!")
     return state
@@ -160,7 +195,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "run_dir", 
         nargs="?", 
-        default="./sz0_test_value", 
+        default="./sz0_run2", 
         help="Path to the checkpoint directory for this training run (default: ./sz0_test_value)"
     )
     args = parser.parse_args()
