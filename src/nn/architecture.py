@@ -17,9 +17,9 @@ class ShatranjBlock(nn.Module):
         # Phase A: Pre-LN Self Attention
         attn_input = nn.LayerNorm()(x)
         
-        q = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
-        k = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 3, 1))
-        v = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
+        q = nn.Dense(self.d_model, use_bias=False)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
+        k = nn.Dense(self.d_model, use_bias=False)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 3, 1))
+        v = nn.Dense(self.d_model, use_bias=False)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
 
         logits = jnp.matmul(q, k) / jnp.sqrt(head_dim)
 
