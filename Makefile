@@ -1,5 +1,4 @@
 EXE := SZ0
-EVALFILE := sz0_small.onnx
 ARCH := native
 TUNE := native
 DEBUG := no
@@ -26,10 +25,6 @@ ifeq ($(CXX), g++)
 	CC := gcc
 endif
 
-ifeq ($(GPU), yes)
-	EVALFILE := sz0_small_batched.onnx
-endif
-
 ONNX_DIR := onnx
 INCLUDES := -I$(ONNX_DIR)/include
 LDFLAGS  := -L$(ONNX_DIR)/lib 
@@ -37,10 +32,10 @@ LDLIBS   := -lonnxruntime
 
 
 ifeq ($(DEBUG), no)
-	CXXFLAGS := -O3 -march=$(ARCH) -mtune=$(TUNE) -std=c++23 -pthread -DNNFILE=\"$(EVALFILE)\"
+	CXXFLAGS := -O3 -march=$(ARCH) -mtune=$(TUNE) -std=c++23 -pthread
 	CFLAGS := -O3 -march=$(ARCH) -mtune=$(TUNE)
 else
-	CXXFLAGS := -g -march=$(ARCH) -mtune=$(TUNE) -std=c++23 -pthread -DNNFILE=\"$(EVALFILE)\"
+	CXXFLAGS := -g -march=$(ARCH) -mtune=$(TUNE) -std=c++23 -pthread
 	CFLAGS := -g -march=$(ARCH) -mtune=$(TUNE)
 endif
 

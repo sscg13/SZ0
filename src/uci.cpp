@@ -1,5 +1,6 @@
 #include "datagen.h"
 #include "inference.h"
+#include "nnfile.h"
 #include "node.h"
 #include "position.h"
 #include "search.h"
@@ -12,15 +13,7 @@
 #include <thread>
 #include <vector>
 
-// clang-format off
-std::string uciinfostring = 
-"id name Shatranj Zer0\n"
-"id author sscg13\n"
-"option name UCI_Variant type combo default shatranj var shatranj\n"
-"option name Threads type spin default 1 min 1 max 16\n"
-"option name Hash type spin default 72 min 1 max 32768\n"
-"uciok\n";
-// clang-format on
+std::unique_ptr<NNEvaluator> nn = nullptr;
 
 void uci() {
   std::string ucicommand;
@@ -28,7 +21,8 @@ void uci() {
   current_pos.initialize();
   TreeArena arena(defaultarenasize);
   std::vector<U64> game_hashes;
-  NNEvaluator nn(NNFILE);
+  std::string default_weights = get_latest_onnx_file();
+  reload_network(default_weights);
   int threadcount = 1;
 
   while (std::getline(std::cin, ucicommand)) {
@@ -39,7 +33,15 @@ void uci() {
       break;
     }
     if (token == "uci") {
-      std::cout << uciinfostring;
+      std::cout
+          << "id name Shatranj Zer0\n"
+          << "id author sscg13\n"
+          << "option name UCI_Variant type combo default shatranj var "
+             "shatranj\n"
+          << "option name Threads type spin default 1 min 1 max 16\n"
+          << "option name Hash type spin default 72 min 1 max 32768\n"
+          << "option name WeightsFile type string default <autodiscover>\n"
+          << "uciok\n";
     }
     if (token == "isready") {
       std::cout << "readyok\n";
@@ -117,11 +119,11 @@ void uci() {
         int ourtime = current_pos.stm ? btime : wtime;
         int ourinc = current_pos.stm ? binc : winc;
         if (ourtime > 0) {
-          movetime = (ourtime + 7 * ourinc) / 10;
+          movetime = (ourtime + 35 * ourinc) / 40;
         }
       }
       arena.clear();
-      search_position(nn, arena, current_pos, game_hashes, movetime, nodecount,
+      search_position(*nn, arena, current_pos, game_hashes, movetime, nodecount,
                       threadcount, true);
     }
     if (token == "setoption") {
@@ -137,6 +139,52 @@ void uci() {
         tokens >> token;
         threadcount = std::stoi(token);
       }
+      if (token == "WeightsFile") {
+        tokens >> token;
+        tokens >> token;
+        if (token != "<autodiscover>") {
+          reload_network(token);
+        }
+      }
+    }
+    if (token == "eval") {
+      Move moves[maxmoves];
+      int movecount = current_pos.generatemoves(moves);
+      NNOutput raw_nn = nn->infer(current_pos);
+      MCTSEval processed =
+          parse_nn_output(raw_nn, moves, movecount, current_pos.stm);
+
+      std::cout << "Value (STM): " << processed.qscore << "\n";
+      float max_v_logit =
+          std::max({raw_nn.value[0], raw_nn.value[1], raw_nn.value[2]});
+      float exp_w = std::exp(raw_nn.value[0] - max_v_logit);
+      float exp_d = std::exp(raw_nn.value[1] - max_v_logit);
+      float exp_l = std::exp(raw_nn.value[2] - max_v_logit);
+      float sum_v = exp_w + exp_d + exp_l;
+
+      float prob_win = exp_w / sum_v;
+      float prob_draw = exp_d / sum_v;
+      float prob_loss = exp_l / sum_v;
+      std::cout << "W: " << prob_win << " D: " << prob_draw
+                << " L: " << prob_loss << "\n";
+      struct MovePrior {
+        Move m;
+        float p;
+      };
+      std::vector<MovePrior> ranked_moves;
+      for (int i = 0; i < movecount; i++) {
+        ranked_moves.push_back({moves[i], processed.priors[i]});
+      }
+
+      std::sort(
+          ranked_moves.begin(), ranked_moves.end(),
+          [](const MovePrior &a, const MovePrior &b) { return a.p > b.p; });
+
+      std::cout << "Policy:\n";
+      for (int i = 0; i < movecount; i++) {
+        std::cout << "  " << i + 1 << ". " << algebraic(ranked_moves[i].m)
+                  << " | Prior: " << ranked_moves[i].p * 100.0f << "%\n";
+      }
     }
   }
 }
@@ -147,22 +195,33 @@ int main(int argc, char *argv[]) {
   initializerankattacks();
   initializezobrist();
   setvbuf(stdout, NULL, _IONBF, 0);
+
   if (argc > 1 && std::string(argv[1]) == "datagen") {
     if (argc < 5) {
-      std::cerr << "Proper usage: ./(exe) datagen <game_count> "
+      std::cerr << "Proper usage: ./(exe) datagen <position_count> "
                    "<nodes> <output_file>\n";
       return 0;
     }
-    int num_games = atoi(argv[2]);
+    std::string default_weights = get_latest_onnx_file();
+    if (default_weights == "<empty>") {
+      std::cerr << "Error: No onnx file found in directory\n";
+      return 0;
+    }
+
+    reload_network(default_weights);
+
+    int num_positions = atoi(argv[2]);
     int node_limit = atoi(argv[3]);
     std::string outputfile(argv[4]);
 
     std::cout << "Starting Data Generation Engine...\n";
+    std::cout << "Using weights file: " << default_weights << "\n";
     std::cout << "Nodes/Move: " << node_limit << "\n";
+    std::cout << "Position target: " << num_positions << "\n";
     std::cout << "Data Output: " << outputfile << ".data\n";
 
-    NNEvaluator nn(NNFILE);
-    generate_batched_selfplay_games(nn, outputfile, node_limit, num_games);
+    NNEvaluator nn(default_weights.c_str());
+    generate_batched_selfplay_games(nn, outputfile, node_limit, num_positions);
 
     return 0;
   } else {

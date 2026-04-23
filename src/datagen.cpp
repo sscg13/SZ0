@@ -3,14 +3,15 @@
 #include "search.h"
 
 #include <barrier>
+#include <cmath>
 #include <fstream>
 #include <thread>
 
-void save_game_to_binary(const std::vector<TrainingPosition> &game_history,
-                         std::ofstream &out) {
+int save_game_to_binary(const std::vector<TrainingPosition> &game_history,
+                        std::ofstream &out) {
   if (!out) {
     std::cerr << "Error: Could not open pipe for writing.\n";
-    return;
+    return 0;
   }
 
   for (const auto &pos : game_history) {
@@ -35,6 +36,8 @@ void save_game_to_binary(const std::vector<TrainingPosition> &game_history,
                 pos.num_moves * sizeof(float));
     }
   }
+
+  return (int)game_history.size();
 }
 
 void get_canonical_tokens(const Position &pos, uint8_t tokens[64]) {
@@ -149,7 +152,7 @@ void expand(DatagenGame &game, const NNOutput &raw_nn) {
       parse_nn_output(raw_nn, moves, movecount, game.leaf_pos.stm);
   float value = processed.qscore;
 
-  U32 child_start = game.arena.active_nodes;
+  U32 child_start = game.arena.active_nodes.load(std::memory_order_relaxed);
 
   if (child_start + movecount < game.arena.max_nodes) {
     game.arena.active_nodes.fetch_add(movecount, std::memory_order_relaxed);
@@ -173,7 +176,7 @@ void expand(DatagenGame &game, const NNOutput &raw_nn) {
 
 void generate_batched_selfplay_games(NNEvaluator &nn,
                                      const std::string &output_prefix,
-                                     U64 nodecount, int total_games_to_play) {
+                                     U64 nodecount, int total_positions) {
   std::string filename = output_prefix + ".data";
   std::ofstream out(filename, std::ios::binary | std::ios::app);
   if (!out.is_open()) {
@@ -222,7 +225,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
     std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
 
     for (int i = start_idx; i < end_idx; ++i) {
-        games[i]->reset(rng);
+      games[i]->reset(rng);
     }
 
     while (true) {
@@ -233,8 +236,6 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
       for (int i = start_idx; i < end_idx; ++i) {
         shared_needs_nn[i] = 0;
         DatagenGame &g = *games[i];
-        if (!g.is_active)
-          continue;
 
         if (g.rollouts_completed < nodecount) {
           bool needs_nn = select(g);
@@ -251,7 +252,8 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             for (int sq = 0; sq < 64; ++sq) {
               int p_sq = g.leaf_pos.stm ? (sq ^ 56) : sq;
               batched_pieces[(b_idx * 64) + p_sq] =
-                  perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm);
+                  perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm) +
+                  13 * p_sq;
             }
             batched_halfmoves[b_idx] = g.leaf_pos.halfmovecount;
           }
@@ -280,8 +282,8 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         // Reset the atomic batch size for the next MCTS loop
         current_batch_size.store(0, std::memory_order_relaxed);
 
-        if (games_completed.load(std::memory_order_relaxed) >=
-            total_games_to_play) {
+        if (positions_written.load(std::memory_order_relaxed) >=
+            total_positions) {
           keep_running.store(false, std::memory_order_relaxed);
         }
         auto now = std::chrono::high_resolution_clock::now();
@@ -309,8 +311,6 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
       // ==========================================
       for (int i = start_idx; i < end_idx; ++i) {
         DatagenGame &g = *games[i];
-        if (!g.is_active)
-          continue;
 
         if (shared_needs_nn[i] && g.rollouts_completed < nodecount) {
           expand(g, shared_nn_results[i]);
@@ -337,12 +337,31 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             get_canonical_tokens(g.root_pos, train_pos.board_tokens);
             train_pos.num_moves = root.num_children;
             train_pos.root_q =
-                root.value_sum /
+                root.value_sum.load(std::memory_order_relaxed) /
                 std::max(1, root.visits.load(std::memory_order_relaxed));
 
-            float random_choice = prob_dist(rng);
-            float cumulative_prob = 0.0f;
-            Move selected_move = g.arena.nodes[root.first_child_idx].move;
+            float temperature;
+            if (g.ply_count < 60) {
+              temperature = 1.0f - 0.7f * g.ply_count / 60.0f;
+            } else {
+              temperature = 0.3f;
+            }
+
+            int best_child_idx = 0;
+            int max_visits = -1;
+
+            for (int c = 0; c < root.num_children; ++c) {
+              int v = g.arena.nodes[root.first_child_idx + c].visits.load(
+                  std::memory_order_relaxed);
+              if (v > max_visits) {
+                max_visits = v;
+                best_child_idx = c;
+              }
+            }
+
+            // Default to greedy best move; overridden below for T > 0
+            Move selected_move =
+                g.arena.nodes[root.first_child_idx + best_child_idx].move;
 
             for (int c = 0; c < root.num_children; ++c) {
               Node &child = g.arena.nodes[root.first_child_idx + c];
@@ -350,15 +369,37 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
 
               int from_sq = g.root_pos.stm ? (m.from() ^ 56) : m.from();
               int to_sq = g.root_pos.stm ? (m.to() ^ 56) : m.to();
-
               train_pos.move_indices[c] = (from_sq * 64) + to_sq;
-              float visit_prob = static_cast<float>(child.visits.load(std::memory_order_relaxed)) / total_child_visits;
-              train_pos.move_probabilities[c] = visit_prob;
 
-              cumulative_prob += visit_prob;
-              if (random_choice <= cumulative_prob && random_choice != -1.0f) {
-                selected_move = m;
-                random_choice = -1.0f;
+              float visit_prob = static_cast<float>(child.visits.load(
+                                     std::memory_order_relaxed)) /
+                                 total_child_visits;
+              train_pos.move_probabilities[c] = visit_prob;
+            }
+
+            if (temperature > 0.0f) {
+              // Normalize by max visits before exponentiation to prevent
+              // overflow: (v/v_max)^(1/T) is equivalent since v_max^(1/T)
+              // is a common factor that cancels in normalization.
+              float inv_temp = 1.0f / temperature;
+              float sum_tempered = 0.0f;
+              for (int c = 0; c < root.num_children; ++c) {
+                int v = g.arena.nodes[root.first_child_idx + c].visits.load(
+                    std::memory_order_relaxed);
+                sum_tempered +=
+                    std::pow(static_cast<float>(v) / max_visits, inv_temp);
+              }
+              float random_choice = prob_dist(rng) * sum_tempered;
+              float cumulative = 0.0f;
+              for (int c = 0; c < root.num_children; ++c) {
+                int v = g.arena.nodes[root.first_child_idx + c].visits.load(
+                    std::memory_order_relaxed);
+                cumulative +=
+                    std::pow(static_cast<float>(v) / max_visits, inv_temp);
+                if (random_choice <= cumulative) {
+                  selected_move = g.arena.nodes[root.first_child_idx + c].move;
+                  break;
+                }
               }
             }
 
@@ -396,21 +437,14 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
 
             {
               std::lock_guard<std::mutex> lock(file_mutex);
-              save_game_to_binary(g.game_history, out);
+              positions_written += save_game_to_binary(g.game_history, out);
               int current_games = ++games_completed;
-              positions_written += g.game_history.size();
 
-              std::cout << "                   Games completed: "
-                        << current_games << " / " << total_games_to_play
-                        << " (Positions written: " << positions_written.load()
-                        << ")\r" << std::flush;
+              std::cout << "Positions: " << positions_written.load() << " / "
+                        << total_positions << "  Games: " << current_games
+                        << "\r" << std::flush;
 
-              // Reset game logic (something not quite right here?)
-              if (current_games + datagenbatchsize <= total_games_to_play) {
-                g.reset(rng);
-              } else {
-                g.is_active = false;
-              }
+              g.reset(rng);
             }
           }
 

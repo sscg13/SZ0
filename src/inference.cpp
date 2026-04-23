@@ -61,7 +61,8 @@ NNOutput NNEvaluator::infer(const Position &pos) {
 
   for (int i = 0; i < 64; ++i) {
     int perspective_square = pos.stm ? (i ^ 56) : i;
-    board_data[perspective_square] = perspectivepiece(pos.pieces[i], pos.stm);
+    board_data[perspective_square] =
+        perspectivepiece(pos.pieces[i], pos.stm) + 13 * perspective_square;
   }
 
   static const int64_t board_shape[] = {1, 64};
