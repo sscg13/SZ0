@@ -4,29 +4,27 @@ import flax.linen as nn
 
 # --- 1. Model Definitions (The Blueprint) ---
 
-class ShatranjBlock(nn.Module):
+class Attention(nn.Module):
     d_model: int = 256
     num_heads: int = 8
-    d_ff: int = 256
 
     @nn.compact
     def __call__(self, x):
         b, seq_len, _ = x.shape
         head_dim = self.d_model // self.num_heads
-        
-        # Phase A: Pre-LN Self Attention
+
         attn_input = nn.LayerNorm()(x)
-        
+
         q = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
         k = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 3, 1))
         v = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
 
         logits = jnp.matmul(q, k) / jnp.sqrt(head_dim)
 
-        # Broadcastable Spatial Bias: (1, 8, 64, 64)
+        # Broadcastable Spatial Bias: (1, num_heads, seq_len, seq_len)
         spatial_bias = self.param(
-            'spatial_bias', 
-            nn.initializers.normal(stddev=0.02), 
+            'spatial_bias',
+            nn.initializers.normal(stddev=0.02),
             (1, self.num_heads, seq_len, seq_len)
         )
         logits = logits + spatial_bias
@@ -36,16 +34,32 @@ class ShatranjBlock(nn.Module):
 
         attn_out = attn_out.transpose((0, 2, 1, 3)).reshape((b, seq_len, self.d_model))
         attn_out = nn.Dense(self.d_model)(attn_out)
-        
-        x = x + attn_out
 
-        # Phase B: Pre-LN Feed Forward (MLP)
+        return x + attn_out
+
+
+class FeedForward(nn.Module):
+    d_model: int = 256
+    d_ff: int = 256
+
+    @nn.compact
+    def __call__(self, x):
         ff_input = nn.LayerNorm()(x)
         ff_out = nn.Dense(self.d_ff)(ff_input)
         ff_out = nn.gelu(ff_out)
         ff_out = nn.Dense(self.d_model)(ff_out)
-        x = x + ff_out
+        return x + ff_out
 
+
+class ShatranjBlock(nn.Module):
+    d_model: int = 256
+    num_heads: int = 8
+    d_ff: int = 256
+
+    @nn.compact
+    def __call__(self, x):
+        x = Attention(self.d_model, self.num_heads)(x)
+        x = FeedForward(self.d_model, self.d_ff)(x)
         return x
 
 class ShatranjNet(nn.Module):
