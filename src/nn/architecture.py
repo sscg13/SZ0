@@ -45,8 +45,9 @@ class FeedForward(nn.Module):
     @nn.compact
     def __call__(self, x):
         ff_input = nn.LayerNorm()(x)
-        ff_out = nn.Dense(self.d_ff)(ff_input)
-        ff_out = nn.gelu(ff_out)
+        gate = nn.Dense(self.d_ff)(ff_input)
+        value = nn.Dense(self.d_ff)(ff_input)
+        ff_out = jax.nn.silu(gate) * value
         ff_out = nn.Dense(self.d_model)(ff_out)
         return x + ff_out
 
