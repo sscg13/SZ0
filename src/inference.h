@@ -27,7 +27,7 @@ class NNEvaluator {
 
   // According to ONNX
   std::vector<const char *> input_names = {"in_0", "in_1"};
-  std::vector<const char *> output_names = {"div_out_6", "out_38"};
+  std::vector<const char *> output_names = {"policy", "value"};
 
 public:
   NNEvaluator(const char *model_path)

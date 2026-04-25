@@ -3,6 +3,7 @@ import os
 import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
+import onnx
 
 from flax.training import train_state
 import optax
@@ -71,6 +72,18 @@ def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batc
         optimized.convert_float_to_float16()
         
     optimized.save_model_to_file(output_onnx_path)
+
+    print("5. Renaming outputs to stable names...")
+    model = onnx.load(output_onnx_path)
+    graph = model.graph
+    # Outputs are in return order from ShatranjNet: (policy_logits, value_logits)
+    stable_names = ["policy", "value"]
+    for out_proto, new_name in zip(graph.output, stable_names):
+        old_name = out_proto.name
+        for node in graph.node:
+            node.output[:] = [new_name if o == old_name else o for o in node.output]
+        out_proto.name = new_name
+    onnx.save(model, output_onnx_path)
     print(f"Success! ONNX model saved to: {output_onnx_path}")
 
 def get_latest_step(checkpoint_dir):
