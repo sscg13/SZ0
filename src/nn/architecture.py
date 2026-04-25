@@ -59,11 +59,12 @@ class ShatranjBlock(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = Attention(self.d_model, self.num_heads)(x)
+        x = Attention(self.d_model, self.num_heads)(x)
         x = FeedForward(self.d_model, self.d_ff)(x)
         return x
 
 class ShatranjNet(nn.Module):
-    num_layers: int = 6
+    num_layers: int = 4
     d_model: int = 256
     num_heads: int = 8
     d_ff: int = 256
