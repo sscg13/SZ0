@@ -46,7 +46,7 @@ class FeedForward(nn.Module):
     def __call__(self, x):
         ff_input = nn.LayerNorm()(x)
         ff_out = nn.Dense(self.d_ff)(ff_input)
-        ff_out = nn.gelu(ff_out)
+        ff_out = nn.silu(ff_out)
         ff_out = nn.Dense(self.d_model)(ff_out)
         return x + ff_out
 
