@@ -100,23 +100,27 @@ public:
 
 // Collects leaf positions from MCTS workers, batches them for GPU inference,
 // and delivers results back via promise/future. A single dedicated thread
-// runs run_inference_loop(); workers call evaluate() which blocks until the
-// batch containing their request is processed.
+// runs run_inference_loop(); workers call submit() to enqueue a position and
+// receive a future they can poll without blocking.
 class BatchEvaluator {
 public:
-  BatchEvaluator(NNEvaluator &nn, int max_batch_size)
+  // max_batch_size must match the ONNX model's exported batch dimension.
+  explicit BatchEvaluator(NNEvaluator &nn, int max_batch_size)
       : nn_(nn), max_batch_(max_batch_size), stopped_(false) {}
 
-  // Called by MCTS worker threads. Encodes the position, enqueues a request,
-  // and blocks until the inference thread fulfills it.
-  NNOutput evaluate(const Position &pos);
+  // Non-blocking: encode the position, enqueue a request, and return a future.
+  // The future is fulfilled by the inference thread once its batch is processed.
+  std::future<NNOutput> submit(const Position &pos);
 
-  // Called on a dedicated thread. Drains the queue in batches until stop()
-  // is called and no pending requests remain.
+  // Blocking convenience wrapper (used by datagen / single-threaded callers).
+  NNOutput evaluate(const Position &pos) { return submit(pos).get(); }
+
+  // Called on a dedicated thread. Fires batches when max_batch_ requests are
+  // queued, or after a short timeout for partial batches near end-of-search.
   void run_inference_loop();
 
-  // Signal the inference thread to exit after draining remaining requests.
-  // Must be called after all worker threads have finished.
+  // Signal the inference thread to drain remaining requests and exit.
+  // Must be called after all worker threads have finished submitting.
   void stop();
 
 private:

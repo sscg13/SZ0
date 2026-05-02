@@ -161,7 +161,7 @@ void NNEvaluator::infer_packed(const std::vector<int32_t> &flat_pieces,
   }
 }
 
-NNOutput BatchEvaluator::evaluate(const Position &pos) {
+std::future<NNOutput> BatchEvaluator::submit(const Position &pos) {
   int32_t board_data[64];
   int32_t halfmove = static_cast<int32_t>(pos.halfmovecount);
 
@@ -180,18 +180,17 @@ NNOutput BatchEvaluator::evaluate(const Position &pos) {
     std::copy(board_data, board_data + 64, req.board_data);
     req.halfmove = halfmove;
     req.promise = std::move(promise);
-
     cv_.notify_one();
   }
 
-  return future.get();
+  return future;
 }
 
 void BatchEvaluator::process_batch(std::vector<Request> batch) {
   int real_count = static_cast<int>(batch.size());
 
   // Always allocate max_batch_ slots so the tensor shape matches the model's
-  // hardcoded batch dimension. Unused slots are left as zeros (padding).
+  // hardcoded batch dimension. Unused slots are zero-padded.
   std::vector<int32_t> flat_pieces(max_batch_ * 64, 0);
   std::vector<int32_t> flat_halfmoves(max_batch_, 0);
 
@@ -214,18 +213,23 @@ void BatchEvaluator::run_inference_loop() {
     std::vector<Request> batch;
     {
       std::unique_lock<std::mutex> lk(mtx_);
-      cv_.wait_for(lk, 5ms, [&] {
+      // Fire when the full batch is ready; fall back after 500 µs so partial
+      // batches aren't stranded when workers hit terminals or search ends.
+      cv_.wait_for(lk, 500us, [&] {
         return static_cast<int>(pending_.size()) >= max_batch_ || stopped_;
       });
       if (pending_.empty() && stopped_)
         break;
-      batch = std::move(pending_);
-      pending_.clear();
+      // Cap at max_batch_ so we never exceed the model's tensor dimension.
+      int take = std::min(static_cast<int>(pending_.size()), max_batch_);
+      batch.reserve(take);
+      for (int i = 0; i < take; ++i)
+        batch.push_back(std::move(pending_[i]));
+      pending_.erase(pending_.begin(), pending_.begin() + take);
     }
 
-    if (!batch.empty()) {
+    if (!batch.empty())
       process_batch(std::move(batch));
-    }
   }
 }
 

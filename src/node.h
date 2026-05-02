@@ -2,6 +2,7 @@
 #include "position.h"
 
 #include <atomic>
+#include <future>
 #include <memory>
 #include <random>
 #include <vector>
@@ -39,9 +40,38 @@ struct TreeArena {
   void clear();
 };
 
+// State preserved between mcts_select and mcts_expand_and_backprop.
+struct PendingRollout {
+  std::vector<U32> search_path;
+  std::vector<U64> rollout_hashes;
+  Position leaf_pos;
+  Move moves[maxmoves];
+  int movecount;
+  int depth;
+};
+
 bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
                    const std::vector<U64> &rollout_hashes);
 U32 select_best_puct(const TreeArena &arena, U32 node_idx);
-int mcts_rollout(BatchEvaluator &batch_eval, TreeArena &arena,
-                 const Position &root_pos,
-                 const std::vector<U64> &game_hashes);
+
+// Walk the tree to a leaf and decide what to do:
+//   Returns 0  — collision: another thread is already expanding this leaf.
+//                Discard and retry; the path has been cleaned up.
+//   Returns 1  — terminal: value is written to out_value.
+//                Call mcts_backprop(arena, pending.search_path, out_value).
+//   Returns 2  — needs NN: pending and out_future are valid.
+//                Call mcts_expand_and_backprop once out_future.get() returns.
+int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
+                const Position &root_pos,
+                const std::vector<U64> &game_hashes,
+                PendingRollout &pending,
+                std::future<NNOutput> &out_future,
+                float &out_value);
+
+// Expand the leaf's children from the NN result and backpropagate.
+void mcts_expand_and_backprop(TreeArena &arena, PendingRollout &pending,
+                              const NNOutput &raw_nn);
+
+// Propagate a value (terminal or cached) back along search_path.
+void mcts_backprop(TreeArena &arena, const std::vector<U32> &path,
+                   float value);
