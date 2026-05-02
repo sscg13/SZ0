@@ -114,7 +114,8 @@ if __name__ == "__main__":
         print(f"Detected latest step: {latest_step} in {dir_name}")
 
         conversions = [
-            {"batch": 1, "name": f"{dir_name}_epoch{latest_step}.onnx", "fp16": False},
+            {"batch": 1, "name": f"{dir_name}_epoch{latest_step}_single.onnx", "fp16": False},
+            {"batch": 32, "name": f"{dir_name}_epoch{latest_step}_search.onnx", "fp16": True},
             {"batch": 284, "name": f"{dir_name}_batched.onnx", "fp16": True} 
         ]
 
