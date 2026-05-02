@@ -1,6 +1,10 @@
 #include "position.h"
 
 #include <onnxruntime_cxx_api.h>
+#include <atomic>
+#include <condition_variable>
+#include <future>
+#include <mutex>
 #include <vector>
 
 #pragma once
@@ -88,4 +92,50 @@ public:
                     const std::vector<int32_t> &flat_halfmoves,
                     std::vector<NNOutput> &shared_results,
                     const std::vector<int> &batch_to_game_idx);
+  std::vector<NNOutput> infer_dynamic_batch(
+      const std::vector<int32_t> &flat_pieces,
+      const std::vector<int32_t> &flat_halfmoves,
+      int batch_size);
+};
+
+// Collects leaf positions from MCTS workers, batches them for GPU inference,
+// and delivers results back via promise/future. A single dedicated thread
+// runs run_inference_loop(); workers call evaluate() which blocks until the
+// batch containing their request is processed.
+class BatchEvaluator {
+public:
+  BatchEvaluator(NNEvaluator &nn, int max_batch_size)
+      : nn_(nn), max_batch_(max_batch_size), stopped_(false) {}
+
+  // Called by MCTS worker threads. Encodes the position, enqueues a request,
+  // and blocks until the inference thread fulfills it.
+  NNOutput evaluate(const Position &pos);
+
+  // Called on a dedicated thread. Drains the queue in batches until stop()
+  // is called and no pending requests remain.
+  void run_inference_loop();
+
+  // Signal the inference thread to exit after draining remaining requests.
+  // Must be called after all worker threads have finished.
+  void stop();
+
+private:
+  struct Request {
+    int32_t board_data[64];
+    int32_t halfmove;
+    std::promise<NNOutput> promise;
+
+    Request() = default;
+    Request(Request &&) = default;
+    Request &operator=(Request &&) = default;
+  };
+
+  void process_batch(std::vector<Request> batch);
+
+  NNEvaluator &nn_;
+  int max_batch_;
+  bool stopped_;
+  std::mutex mtx_;
+  std::condition_variable cv_;
+  std::vector<Request> pending_;
 };

@@ -53,3 +53,5 @@ constexpr int defaultarenasize = 3145728;
 constexpr int datagenarenasize = 65536;
 constexpr int datagenbatchsize = 284;
 constexpr int datagenthreads = 8;
+// Must match the batch dimension the search ONNX model was exported with.
+constexpr int searchbatchsize = 8;

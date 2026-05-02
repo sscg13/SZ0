@@ -1,6 +1,7 @@
 #include "inference.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 MCTSEval parse_nn_output(const NNOutput &raw_nn, const Move *moves,
@@ -88,6 +89,41 @@ NNOutput NNEvaluator::infer(const Position &pos) {
   return result;
 }
 
+std::vector<NNOutput> NNEvaluator::infer_dynamic_batch(
+    const std::vector<int32_t> &flat_pieces,
+    const std::vector<int32_t> &flat_halfmoves,
+    int batch_size) {
+  std::array<int64_t, 2> board_shape{batch_size, 64};
+  std::array<int64_t, 1> halfmove_shape{batch_size};
+
+  Ort::Value board_tensor = Ort::Value::CreateTensor<int32_t>(
+      memory_info, const_cast<int32_t *>(flat_pieces.data()),
+      flat_pieces.size(), board_shape.data(), board_shape.size());
+
+  Ort::Value halfmove_tensor = Ort::Value::CreateTensor<int32_t>(
+      memory_info, const_cast<int32_t *>(flat_halfmoves.data()),
+      flat_halfmoves.size(), halfmove_shape.data(), halfmove_shape.size());
+
+  Ort::Value input_tensors[2] = {std::move(board_tensor),
+                                 std::move(halfmove_tensor)};
+
+  auto output_tensors =
+      session.Run(Ort::RunOptions{nullptr}, input_names.data(), input_tensors,
+                  2, output_names.data(), output_names.size());
+
+  std::vector<NNOutput> results(batch_size);
+  const float *policy_ptr = output_tensors[0].GetTensorData<float>();
+  const float *value_ptr = output_tensors[1].GetTensorData<float>();
+
+  for (int b = 0; b < batch_size; ++b) {
+    std::copy(policy_ptr + b * 4096, policy_ptr + (b + 1) * 4096,
+              results[b].policy);
+    std::copy(value_ptr + b * 3, value_ptr + (b + 1) * 3, results[b].value);
+  }
+
+  return results;
+}
+
 void NNEvaluator::infer_packed(const std::vector<int32_t> &flat_pieces,
                                const std::vector<int32_t> &flat_halfmoves,
                                std::vector<NNOutput> &shared_results,
@@ -123,4 +159,80 @@ void NNEvaluator::infer_packed(const std::vector<int32_t> &flat_pieces,
     std::copy(value_ptr + (b * 3), value_ptr + ((b + 1) * 3),
               shared_results[target_game].value);
   }
+}
+
+NNOutput BatchEvaluator::evaluate(const Position &pos) {
+  int32_t board_data[64];
+  int32_t halfmove = static_cast<int32_t>(pos.halfmovecount);
+
+  for (int i = 0; i < 64; ++i) {
+    int ps = pos.stm ? (i ^ 56) : i;
+    board_data[ps] = perspectivepiece(pos.pieces[i], pos.stm) + 13 * ps;
+  }
+
+  std::promise<NNOutput> promise;
+  std::future<NNOutput> future = promise.get_future();
+
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    pending_.emplace_back();
+    Request &req = pending_.back();
+    std::copy(board_data, board_data + 64, req.board_data);
+    req.halfmove = halfmove;
+    req.promise = std::move(promise);
+
+    cv_.notify_one();
+  }
+
+  return future.get();
+}
+
+void BatchEvaluator::process_batch(std::vector<Request> batch) {
+  int real_count = static_cast<int>(batch.size());
+
+  // Always allocate max_batch_ slots so the tensor shape matches the model's
+  // hardcoded batch dimension. Unused slots are left as zeros (padding).
+  std::vector<int32_t> flat_pieces(max_batch_ * 64, 0);
+  std::vector<int32_t> flat_halfmoves(max_batch_, 0);
+
+  for (int i = 0; i < real_count; ++i) {
+    std::copy(batch[i].board_data, batch[i].board_data + 64,
+              flat_pieces.data() + i * 64);
+    flat_halfmoves[i] = batch[i].halfmove;
+  }
+
+  auto results = nn_.infer_dynamic_batch(flat_pieces, flat_halfmoves, max_batch_);
+
+  for (int i = 0; i < real_count; ++i) {
+    batch[i].promise.set_value(std::move(results[i]));
+  }
+}
+
+void BatchEvaluator::run_inference_loop() {
+  using namespace std::chrono_literals;
+  while (true) {
+    std::vector<Request> batch;
+    {
+      std::unique_lock<std::mutex> lk(mtx_);
+      cv_.wait_for(lk, 5ms, [&] {
+        return static_cast<int>(pending_.size()) >= max_batch_ || stopped_;
+      });
+      if (pending_.empty() && stopped_)
+        break;
+      batch = std::move(pending_);
+      pending_.clear();
+    }
+
+    if (!batch.empty()) {
+      process_batch(std::move(batch));
+    }
+  }
+}
+
+void BatchEvaluator::stop() {
+  {
+    std::lock_guard<std::mutex> lk(mtx_);
+    stopped_ = true;
+  }
+  cv_.notify_all();
 }

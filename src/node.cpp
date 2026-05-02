@@ -94,7 +94,8 @@ bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
   return false;
 }
 
-int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
+int mcts_rollout(BatchEvaluator &batch_eval, TreeArena &arena,
+                 const Position &root_pos,
                  const std::vector<U64> &game_hashes) {
   Position current_pos = root_pos;
   U32 current_idx = 0;
@@ -143,7 +144,7 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
         if (movecount == 0) {
           value = -1.0f;
         } else {
-          NNOutput raw_nn = nn.infer(current_pos);
+          NNOutput raw_nn = batch_eval.evaluate(current_pos);
           MCTSEval processed =
               parse_nn_output(raw_nn, moves, movecount, current_pos.stm);
           value = processed.qscore;

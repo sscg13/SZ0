@@ -42,5 +42,6 @@ struct TreeArena {
 bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
                    const std::vector<U64> &rollout_hashes);
 U32 select_best_puct(const TreeArena &arena, U32 node_idx);
-int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
+int mcts_rollout(BatchEvaluator &batch_eval, TreeArena &arena,
+                 const Position &root_pos,
                  const std::vector<U64> &game_hashes);

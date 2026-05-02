@@ -53,10 +53,10 @@ void printinfostring(const TreeArena &arena, int timetaken, int avgdepth,
             << " pv " << pv.str() << "\n";
 }
 
-void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
+void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena, Position root_pos,
                  std::vector<uint64_t> game_history) {
   while (!stop_search.load(std::memory_order_relaxed)) {
-    int depth = mcts_rollout(nn, arena, root_pos, game_history);
+    int depth = mcts_rollout(batch_eval, arena, root_pos, game_history);
     if (depth == 0) {
       std::this_thread::yield();
       continue;
@@ -97,12 +97,15 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
   depthsum.store(0, std::memory_order_relaxed);
   arena.clear();
 
+  BatchEvaluator batch_eval(nn, searchbatchsize);
+  std::thread infer_thread([&batch_eval] { batch_eval.run_inference_loop(); });
+
   auto start = std::chrono::steady_clock::now();
   auto last_info = start;
 
   std::vector<std::thread> threads;
   for (int i = 0; i < threadcount; ++i) {
-    threads.emplace_back(mcts_worker, std::ref(nn), std::ref(arena),
+    threads.emplace_back(mcts_worker, std::ref(batch_eval), std::ref(arena),
                          current_pos, game_hashes);
   }
   while (!stop_search.load(std::memory_order_relaxed)) {
@@ -140,6 +143,11 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
       t.join();
     }
   }
+
+  // All workers are done — no more evaluate() calls can arrive. Signal the
+  // inference thread to drain remaining requests and exit.
+  batch_eval.stop();
+  infer_thread.join();
 
   auto now = std::chrono::steady_clock::now();
   auto elapsed =
