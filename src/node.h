@@ -68,10 +68,8 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
 //   Returns 2  — needs NN: pending and out_future are valid.
 //                Call mcts_expand_and_backprop once out_future.get() returns.
 int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
-                const Position &root_pos,
-                const std::vector<U64> &game_hashes,
-                PendingRollout &pending,
-                std::future<NNOutput> &out_future,
+                const Position &root_pos, const std::vector<U64> &game_hashes,
+                PendingRollout &pending, std::future<NNOutput> &out_future,
                 float &out_value);
 
 // Expand the leaf's children from the NN result and backpropagate.
@@ -79,5 +77,4 @@ void mcts_expand_and_backprop(TreeArena &arena, PendingRollout &pending,
                               const NNOutput &raw_nn);
 
 // Propagate a value (terminal or cached) back along search_path.
-void mcts_backprop(TreeArena &arena, const std::vector<U32> &path,
-                   float value);
+void mcts_backprop(TreeArena &arena, const std::vector<U32> &path, float value);

@@ -89,10 +89,10 @@ NNOutput NNEvaluator::infer(const Position &pos) {
   return result;
 }
 
-std::vector<NNOutput> NNEvaluator::infer_dynamic_batch(
-    const std::vector<int32_t> &flat_pieces,
-    const std::vector<int32_t> &flat_halfmoves,
-    int batch_size) {
+std::vector<NNOutput>
+NNEvaluator::infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
+                                 const std::vector<int32_t> &flat_halfmoves,
+                                 int batch_size) {
   std::array<int64_t, 2> board_shape{batch_size, 64};
   std::array<int64_t, 1> halfmove_shape{batch_size};
 
@@ -200,7 +200,8 @@ void BatchEvaluator::process_batch(std::vector<Request> batch) {
     flat_halfmoves[i] = batch[i].halfmove;
   }
 
-  auto results = nn_.infer_dynamic_batch(flat_pieces, flat_halfmoves, max_batch_);
+  auto results =
+      nn_.infer_dynamic_batch(flat_pieces, flat_halfmoves, max_batch_);
 
   for (int i = 0; i < real_count; ++i) {
     batch[i].promise.set_value(std::move(results[i]));

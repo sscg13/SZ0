@@ -212,10 +212,8 @@ void mcts_backprop(TreeArena &arena, const std::vector<U32> &path,
 }
 
 int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
-                const Position &root_pos,
-                const std::vector<U64> &game_hashes,
-                PendingRollout &pending,
-                std::future<NNOutput> &out_future,
+                const Position &root_pos, const std::vector<U64> &game_hashes,
+                PendingRollout &pending, std::future<NNOutput> &out_future,
                 float &out_value) {
   Position current_pos = root_pos;
   U32 current_idx = 0;
@@ -297,7 +295,7 @@ void mcts_expand_and_backprop(TreeArena &arena, PendingRollout &pending,
   U32 leaf_idx = pending.search_path.back();
 
   U32 child_start = arena.active_nodes.fetch_add(pending.movecount,
-                                                  std::memory_order_relaxed);
+                                                 std::memory_order_relaxed);
 
   if (child_start + pending.movecount < arena.max_nodes) {
     for (int i = 0; i < pending.movecount; ++i) {

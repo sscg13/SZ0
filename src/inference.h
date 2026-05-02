@@ -1,10 +1,10 @@
 #include "position.h"
 
-#include <onnxruntime_cxx_api.h>
 #include <atomic>
 #include <condition_variable>
 #include <future>
 #include <mutex>
+#include <onnxruntime_cxx_api.h>
 #include <vector>
 
 #pragma once
@@ -92,10 +92,10 @@ public:
                     const std::vector<int32_t> &flat_halfmoves,
                     std::vector<NNOutput> &shared_results,
                     const std::vector<int> &batch_to_game_idx);
-  std::vector<NNOutput> infer_dynamic_batch(
-      const std::vector<int32_t> &flat_pieces,
-      const std::vector<int32_t> &flat_halfmoves,
-      int batch_size);
+  std::vector<NNOutput>
+  infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
+                      const std::vector<int32_t> &flat_halfmoves,
+                      int batch_size);
 };
 
 // Collects leaf positions from MCTS workers, batches them for GPU inference,
@@ -109,7 +109,8 @@ public:
       : nn_(nn), max_batch_(max_batch_size), stopped_(false) {}
 
   // Non-blocking: encode the position, enqueue a request, and return a future.
-  // The future is fulfilled by the inference thread once its batch is processed.
+  // The future is fulfilled by the inference thread once its batch is
+  // processed.
   std::future<NNOutput> submit(const Position &pos);
 
   // Blocking convenience wrapper (used by datagen / single-threaded callers).
