@@ -3,6 +3,7 @@
 #include "position.h"
 
 #include <chrono>
+#include <future>
 #include <sstream>
 #include <thread>
 
@@ -53,6 +54,7 @@ void printinfostring(const TreeArena &arena, int timetaken, int avgdepth,
             << " pv " << pv.str() << "\n";
 }
 
+#ifndef USE_CUDA
 void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
                  std::vector<uint64_t> game_history) {
   while (!stop_search.load(std::memory_order_relaxed)) {
@@ -70,6 +72,73 @@ void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
     depthsum.fetch_add(depth, std::memory_order_relaxed);
   }
 }
+#else
+void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
+                 Position root_pos, std::vector<uint64_t> game_history,
+                 int max_in_flight) {
+  struct InFlight {
+    PendingRollout pending;
+    std::future<NNOutput> future;
+  };
+
+  std::vector<InFlight> in_flight;
+  in_flight.reserve(max_in_flight);
+
+  auto finish_rollout = [&](PendingRollout &pending) {
+    int depth = pending.depth;
+    total_rollouts.fetch_add(1, std::memory_order_relaxed);
+    if (arena.active_nodes.load(std::memory_order_relaxed) >=
+        arena.max_nodes - 256) {
+      stop_search.store(true, std::memory_order_relaxed);
+    }
+    atomic_fetch_max(seldepth, depth);
+    depthsum.fetch_add(depth, std::memory_order_relaxed);
+  };
+
+  while (!stop_search.load(std::memory_order_relaxed)) {
+    // Complete any in-flight rollouts whose futures are ready.
+    for (auto it = in_flight.begin(); it != in_flight.end();) {
+      if (it->future.wait_for(std::chrono::seconds(0)) ==
+          std::future_status::ready) {
+        NNOutput raw_nn = it->future.get();
+        mcts_expand_and_backprop(arena, it->pending, raw_nn);
+        finish_rollout(it->pending);
+        it = in_flight.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    // Start a new rollout if below the in-flight limit.
+    if (static_cast<int>(in_flight.size()) < max_in_flight) {
+      PendingRollout pending;
+      std::future<NNOutput> future;
+      float value;
+
+      int outcome = mcts_select(batch_eval, arena, root_pos, game_history,
+                                pending, future, value);
+
+      if (outcome == 2) {
+        in_flight.push_back({std::move(pending), std::move(future)});
+      } else if (outcome == 1) {
+        mcts_backprop(arena, pending.search_path, value);
+        finish_rollout(pending);
+      }
+      // outcome == 0 (collision): discard and retry next iteration.
+    } else {
+      // All slots are full and no future is ready yet; yield briefly to avoid
+      // spinning while the GPU processes the batch.
+      std::this_thread::yield();
+    }
+  }
+
+  // Drain any in-flight rollouts so virtual visits are removed cleanly.
+  for (auto &item : in_flight) {
+    NNOutput raw_nn = item.future.get();
+    mcts_expand_and_backprop(arena, item.pending, raw_nn);
+  }
+}
+#endif
 
 Move get_best_move(TreeArena &arena) {
   const Node &root_node = arena.nodes[0];
@@ -97,13 +166,27 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
   depthsum.store(0, std::memory_order_relaxed);
   arena.clear();
 
+#ifdef USE_CUDA
+  // Each worker keeps ceil(searchbatchsize / threadcount) rollouts in flight
+  // so that across all workers the batch fills before the inference thread
+  // fires, maximising GPU utilisation.
+  int max_in_flight = (searchbatchsize + threadcount - 1) / threadcount;
+  BatchEvaluator batch_eval(nn, searchbatchsize);
+  std::thread infer_thread([&batch_eval] { batch_eval.run_inference_loop(); });
+#endif
+
   auto start = std::chrono::steady_clock::now();
   auto last_info = start;
 
   std::vector<std::thread> threads;
   for (int i = 0; i < threadcount; ++i) {
+#ifdef USE_CUDA
+    threads.emplace_back(mcts_worker, std::ref(batch_eval), std::ref(arena),
+                         current_pos, game_hashes, max_in_flight);
+#else
     threads.emplace_back(mcts_worker, std::ref(nn), std::ref(arena),
                          current_pos, game_hashes);
+#endif
   }
   while (!stop_search.load(std::memory_order_relaxed)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -140,6 +223,12 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
       t.join();
     }
   }
+
+#ifdef USE_CUDA
+  // All workers are done — no more submit() calls can arrive.
+  batch_eval.stop();
+  infer_thread.join();
+#endif
 
   auto now = std::chrono::steady_clock::now();
   auto elapsed =

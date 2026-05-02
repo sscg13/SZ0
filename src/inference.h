@@ -1,5 +1,9 @@
 #include "position.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <future>
+#include <mutex>
 #include <onnxruntime_cxx_api.h>
 #include <vector>
 
@@ -88,4 +92,55 @@ public:
                     const std::vector<int32_t> &flat_halfmoves,
                     std::vector<NNOutput> &shared_results,
                     const std::vector<int> &batch_to_game_idx);
+  std::vector<NNOutput>
+  infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
+                      const std::vector<int32_t> &flat_halfmoves,
+                      int batch_size);
+};
+
+// Collects leaf positions from MCTS workers, batches them for GPU inference,
+// and delivers results back via promise/future. A single dedicated thread
+// runs run_inference_loop(); workers call submit() to enqueue a position and
+// receive a future they can poll without blocking.
+class BatchEvaluator {
+public:
+  // max_batch_size must match the ONNX model's exported batch dimension.
+  explicit BatchEvaluator(NNEvaluator &nn, int max_batch_size)
+      : nn_(nn), max_batch_(max_batch_size), stopped_(false) {}
+
+  // Non-blocking: encode the position, enqueue a request, and return a future.
+  // The future is fulfilled by the inference thread once its batch is
+  // processed.
+  std::future<NNOutput> submit(const Position &pos);
+
+  // Blocking convenience wrapper (used by datagen / single-threaded callers).
+  NNOutput evaluate(const Position &pos) { return submit(pos).get(); }
+
+  // Called on a dedicated thread. Fires batches when max_batch_ requests are
+  // queued, or after a short timeout for partial batches near end-of-search.
+  void run_inference_loop();
+
+  // Signal the inference thread to drain remaining requests and exit.
+  // Must be called after all worker threads have finished submitting.
+  void stop();
+
+private:
+  struct Request {
+    int32_t board_data[64];
+    int32_t halfmove;
+    std::promise<NNOutput> promise;
+
+    Request() = default;
+    Request(Request &&) = default;
+    Request &operator=(Request &&) = default;
+  };
+
+  void process_batch(std::vector<Request> batch);
+
+  NNEvaluator &nn_;
+  int max_batch_;
+  bool stopped_;
+  std::mutex mtx_;
+  std::condition_variable cv_;
+  std::vector<Request> pending_;
 };
