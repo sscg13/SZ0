@@ -54,6 +54,12 @@ bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
                    const std::vector<U64> &rollout_hashes);
 U32 select_best_puct(const TreeArena &arena, U32 node_idx);
 
+// CPU path: monolithic rollout with a blocking NN call.
+int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
+                 const std::vector<U64> &game_hashes);
+
+// GPU path — three-phase split so workers stay busy while the GPU runs.
+//
 // Walk the tree to a leaf and decide what to do:
 //   Returns 0  — collision: another thread is already expanding this leaf.
 //                Discard and retry; the path has been cleaned up.

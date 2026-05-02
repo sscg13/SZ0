@@ -94,6 +94,111 @@ bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
   return false;
 }
 
+int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
+                 const std::vector<U64> &game_hashes) {
+  Position current_pos = root_pos;
+  U32 current_idx = 0;
+  std::vector<U32> search_path;
+  std::vector<uint64_t> rollout_hashes;
+  rollout_hashes.reserve(256);
+  search_path.reserve(256);
+  search_path.push_back(current_idx);
+  rollout_hashes.push_back(current_pos.zobristhash);
+  int depth = 0;
+
+  // SELECTION
+  while (arena.nodes[current_idx].num_children > 0) {
+    U32 best_child_idx = select_best_puct(arena, current_idx);
+    current_pos.makemove(arena.nodes[best_child_idx].move);
+    current_idx = best_child_idx;
+    search_path.push_back(current_idx);
+    rollout_hashes.push_back(current_pos.zobristhash);
+    arena.nodes[current_idx].virtual_visits.fetch_add(
+        1, std::memory_order_relaxed);
+    depth++;
+  }
+
+  // EXPANSION
+  float value;
+  if (arena.nodes[current_idx].visits.load(std::memory_order_relaxed) > 0) {
+    float v_sum =
+        arena.nodes[current_idx].value_sum.load(std::memory_order_relaxed);
+    int vis = arena.nodes[current_idx].visits.load(std::memory_order_relaxed);
+    value = v_sum / static_cast<float>(vis);
+  } else {
+    if (!arena.nodes[current_idx].is_expanding.test_and_set(
+            std::memory_order_acquire)) {
+      if (current_pos.twokings()) {
+        value = 0.0f;
+      } else if (current_pos.bareking(!current_pos.stm)) {
+        value = 1.0f;
+      } else if (current_pos.halfmovecount >= 140) {
+        value = 0.0f;
+      } else if (is_repetition(current_pos, game_hashes, rollout_hashes)) {
+        value = 0.0f;
+      } else {
+        Move moves[maxmoves];
+        int movecount = current_pos.generatemoves(moves);
+
+        if (movecount == 0) {
+          value = -1.0f;
+        } else {
+          NNOutput raw_nn = nn.infer(current_pos);
+          MCTSEval processed =
+              parse_nn_output(raw_nn, moves, movecount, current_pos.stm);
+          value = processed.qscore;
+
+          U32 child_start = arena.active_nodes.fetch_add(
+              movecount, std::memory_order_relaxed);
+
+          if (child_start + movecount < arena.max_nodes) {
+            for (int i = 0; i < movecount; i++) {
+              size_t child_idx = child_start + i;
+              arena.nodes[child_idx].move = moves[i];
+              arena.nodes[child_idx].prior = processed.priors[i];
+
+              arena.nodes[child_idx].visits.store(0, std::memory_order_relaxed);
+              arena.nodes[child_idx].value_sum.store(0.0f,
+                                                     std::memory_order_relaxed);
+              arena.nodes[child_idx].first_child_idx = -1;
+              arena.nodes[child_idx].num_children = 0;
+              arena.nodes[child_idx].is_expanding.clear(
+                  std::memory_order_relaxed);
+              arena.nodes[child_idx].virtual_visits.store(
+                  0, std::memory_order_relaxed);
+            }
+
+            std::atomic_thread_fence(std::memory_order_release);
+            arena.nodes[current_idx].first_child_idx = child_start;
+            arena.nodes[current_idx].num_children = movecount;
+          }
+        }
+      }
+    } else {
+      for (int i = search_path.size() - 1; i >= 0; --i) {
+        U32 idx = search_path[i];
+        if (i > 0) {
+          arena.nodes[idx].virtual_visits.fetch_sub(1,
+                                                    std::memory_order_relaxed);
+        }
+      }
+      return 0;
+    }
+  }
+
+  // BACKPROPAGATION
+  for (int i = search_path.size() - 1; i >= 0; --i) {
+    U32 idx = search_path[i];
+    if (i > 0) {
+      arena.nodes[idx].virtual_visits.fetch_sub(1, std::memory_order_relaxed);
+    }
+    arena.nodes[idx].visits.fetch_add(1, std::memory_order_relaxed);
+    arena.nodes[idx].value_sum.fetch_add(value, std::memory_order_relaxed);
+    value = -value;
+  }
+  return depth;
+}
+
 void mcts_backprop(TreeArena &arena, const std::vector<U32> &path,
                    float value) {
   for (int i = static_cast<int>(path.size()) - 1; i >= 0; --i) {
