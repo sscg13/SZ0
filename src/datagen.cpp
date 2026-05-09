@@ -79,15 +79,51 @@ bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes) {
 }
 
 void backprop(DatagenGame &game, float value) {
-  for (int i = game.search_path.size() - 1; i >= 0; --i) {
+  for (int i = static_cast<int>(game.search_path.size()) - 1; i >= 0; --i) {
     U32 idx = game.search_path[i];
-    game.arena.nodes[idx].visits.fetch_add(1, std::memory_order_relaxed);
-    game.arena.nodes[idx].value_sum.fetch_add(value, std::memory_order_relaxed);
+    Node &node = game.arena.nodes[idx];
+    int child_visits = node.visits.fetch_add(1, std::memory_order_relaxed);
+    node.value_sum.fetch_add(value, std::memory_order_relaxed);
+
+    // When an odd-depth (opponent) node first reaches N_scl visits, freeze each
+    // child's current visit count for subsequent Thompson Sampling selection.
+    if (i % 2 == 1 && child_visits == contempt_nscl && node.num_children > 0) {
+      for (U8 c = 0; c < node.num_children; ++c) {
+        Node &child = game.arena.nodes[node.first_child_idx + c];
+        int cv = child.visits.load(std::memory_order_relaxed);
+        child.frozen_visits.store(static_cast<U8>(cv), std::memory_order_relaxed);
+      }
+    }
+
     value = -value;
   }
 }
 
-bool select(DatagenGame &game) {
+// Sample a child node proportionally to frozen_visits (Thompson Sampling).
+static U32 sample_frozen_child(const TreeArena &arena, U32 node_idx,
+                                std::mt19937 &rng) {
+  const Node &node = arena.nodes[node_idx];
+  int total = 0;
+  for (U8 c = 0; c < node.num_children; ++c)
+    total += arena.nodes[node.first_child_idx + c].frozen_visits.load(
+        std::memory_order_relaxed);
+  if (total == 0) {
+    std::uniform_int_distribution<int> dist(0, node.num_children - 1);
+    return node.first_child_idx + dist(rng);
+  }
+  std::uniform_int_distribution<int> dist(0, total - 1);
+  int r = dist(rng);
+  int cumulative = 0;
+  for (U8 c = 0; c < node.num_children; ++c) {
+    cumulative += arena.nodes[node.first_child_idx + c].frozen_visits.load(
+        std::memory_order_relaxed);
+    if (r < cumulative)
+      return node.first_child_idx + c;
+  }
+  return node.first_child_idx + node.num_children - 1;
+}
+
+bool select(DatagenGame &game, std::mt19937 &rng) {
   game.search_path.clear();
   game.leaf_pos = game.root_pos;
   U32 current_idx = 0;
@@ -97,13 +133,23 @@ bool select(DatagenGame &game) {
   rollout_hashes.push_back(game.leaf_pos.zobristhash);
 
   // SELECTION
+  int depth = 0;
   while (game.arena.nodes[current_idx].num_children > 0) {
-    U32 best_child_idx = select_best_puct(game.arena, current_idx);
+    U32 best_child_idx;
+    // Odd-depth nodes are opponent moves: use Thompson Sampling once frozen.
+    if (depth % 2 == 1 &&
+        game.arena.nodes[current_idx].visits.load(std::memory_order_relaxed) >
+            contempt_nscl) {
+      best_child_idx = sample_frozen_child(game.arena, current_idx, rng);
+    } else {
+      best_child_idx = select_best_puct(game.arena, current_idx);
+    }
     game.leaf_pos.makemove(game.arena.nodes[best_child_idx].move);
     current_idx = best_child_idx;
 
     game.search_path.push_back(current_idx);
     rollout_hashes.push_back(game.leaf_pos.zobristhash);
+    depth++;
   }
 
   // TERMINAL CHECKS
@@ -165,6 +211,7 @@ void expand(DatagenGame &game, const NNOutput &raw_nn) {
       game.arena.nodes[child_idx].value_sum = 0.0f;
       game.arena.nodes[child_idx].first_child_idx = -1;
       game.arena.nodes[child_idx].num_children = 0;
+      game.arena.nodes[child_idx].frozen_visits.store(0, std::memory_order_relaxed);
     }
 
     game.arena.nodes[current_idx].first_child_idx = child_start;
@@ -238,7 +285,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         DatagenGame &g = *games[i];
 
         if (g.rollouts_completed < nodecount) {
-          bool needs_nn = select(g);
+          bool needs_nn = select(g, rng);
           if (needs_nn) {
             shared_needs_nn[i] = 1;
 

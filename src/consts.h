@@ -55,3 +55,5 @@ constexpr int datagenbatchsize = 284;
 constexpr int datagenthreads = 8;
 // Must match the batch dimension the search ONNX model was exported with.
 constexpr int searchbatchsize = 8;
+// Search-contempt node limit for datagen
+constexpr int contempt_nscl = 1;

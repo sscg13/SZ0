@@ -56,9 +56,9 @@ void printinfostring(const TreeArena &arena, int timetaken, int avgdepth,
 
 #ifndef USE_CUDA
 void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
-                 std::vector<uint64_t> game_history) {
+                 std::vector<uint64_t> game_history, int nscl) {
   while (!stop_search.load(std::memory_order_relaxed)) {
-    int depth = mcts_rollout(nn, arena, root_pos, game_history);
+    int depth = mcts_rollout(nn, arena, root_pos, game_history, nscl);
     if (depth == 0) {
       std::this_thread::yield();
       continue;
@@ -75,7 +75,7 @@ void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
 #else
 void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
                  Position root_pos, std::vector<uint64_t> game_history,
-                 int max_in_flight) {
+                 int max_in_flight, int nscl) {
   struct InFlight {
     PendingRollout pending;
     std::future<NNOutput> future;
@@ -101,7 +101,7 @@ void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
       if (it->future.wait_for(std::chrono::seconds(0)) ==
           std::future_status::ready) {
         NNOutput raw_nn = it->future.get();
-        mcts_expand_and_backprop(arena, it->pending, raw_nn);
+        mcts_expand_and_backprop(arena, it->pending, raw_nn, nscl);
         finish_rollout(it->pending);
         it = in_flight.erase(it);
       } else {
@@ -116,12 +116,12 @@ void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
       float value;
 
       int outcome = mcts_select(batch_eval, arena, root_pos, game_history,
-                                pending, future, value);
+                                pending, future, value, nscl);
 
       if (outcome == 2) {
         in_flight.push_back({std::move(pending), std::move(future)});
       } else if (outcome == 1) {
-        mcts_backprop(arena, pending.search_path, value);
+        mcts_backprop(arena, pending.search_path, value, nscl);
         finish_rollout(pending);
       }
       // outcome == 0 (collision): discard and retry next iteration.
@@ -135,7 +135,7 @@ void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
   // Drain any in-flight rollouts so virtual visits are removed cleanly.
   for (auto &item : in_flight) {
     NNOutput raw_nn = item.future.get();
-    mcts_expand_and_backprop(arena, item.pending, raw_nn);
+    mcts_expand_and_backprop(arena, item.pending, raw_nn, nscl);
   }
 }
 #endif
@@ -159,7 +159,8 @@ Move get_best_move(TreeArena &arena) {
 void search_position(NNEvaluator &nn, TreeArena &arena,
                      const Position &current_pos,
                      const std::vector<uint64_t> &game_hashes, int timelimit,
-                     U64 nodelimit, int threadcount, bool print_info) {
+                     U64 nodelimit, int threadcount, bool print_info,
+                     int contempt_nscl) {
   stop_search.store(false, std::memory_order_relaxed);
   total_rollouts.store(0, std::memory_order_relaxed);
   seldepth.store(0, std::memory_order_relaxed);
@@ -182,10 +183,11 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
   for (int i = 0; i < threadcount; ++i) {
 #ifdef USE_CUDA
     threads.emplace_back(mcts_worker, std::ref(batch_eval), std::ref(arena),
-                         current_pos, game_hashes, max_in_flight);
+                         current_pos, game_hashes, max_in_flight,
+                         contempt_nscl);
 #else
     threads.emplace_back(mcts_worker, std::ref(nn), std::ref(arena),
-                         current_pos, game_hashes);
+                         current_pos, game_hashes, contempt_nscl);
 #endif
   }
   while (!stop_search.load(std::memory_order_relaxed)) {

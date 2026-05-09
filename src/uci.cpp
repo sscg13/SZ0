@@ -5,6 +5,7 @@
 #include "position.h"
 #include "search.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <iostream>
@@ -24,6 +25,7 @@ void uci() {
   std::string default_weights = get_latest_onnx_file();
   reload_network(default_weights);
   int threadcount = 1;
+  int search_contempt_nscl = 0;
 
   while (std::getline(std::cin, ucicommand)) {
     std::stringstream tokens(ucicommand);
@@ -41,6 +43,8 @@ void uci() {
           << "option name Threads type spin default 1 min 1 max 16\n"
           << "option name Hash type spin default 72 min 1 max 32768\n"
           << "option name WeightsFile type string default <autodiscover>\n"
+          << "option name SearchContemptNodeLimit type spin default 0 min 0 "
+             "max 255\n"
           << "uciok\n";
     }
     if (token == "isready") {
@@ -124,7 +128,7 @@ void uci() {
       }
       arena.clear();
       search_position(*nn, arena, current_pos, game_hashes, movetime, nodecount,
-                      threadcount, true);
+                      threadcount, true, search_contempt_nscl);
     }
     if (token == "setoption") {
       tokens >> token;
@@ -145,6 +149,11 @@ void uci() {
         if (token != "<autodiscover>") {
           reload_network(token);
         }
+      }
+      if (token == "SearchContemptNodeLimit") {
+        tokens >> token;
+        tokens >> token;
+        search_contempt_nscl = std::clamp(std::stoi(token), 0, 255);
       }
     }
     if (token == "eval") {
