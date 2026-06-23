@@ -12,6 +12,7 @@ void TreeArena::clear() {
   nodes[0].is_expanding.clear(std::memory_order_release);
   nodes[0].first_child_idx = -1;
   nodes[0].num_children = 0;
+  nodes[0].frozen_visits.store(0, std::memory_order_relaxed);
   active_nodes.store(1, std::memory_order_relaxed);
 }
 
@@ -94,8 +95,43 @@ bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
   return false;
 }
 
+// Sample a child proportionally to frozen_visits (Thompson Sampling).
+// Uses a thread-local RNG so it is safe to call from multiple worker threads.
+static U32 sample_frozen_child(const TreeArena &arena, U32 node_idx) {
+  thread_local std::mt19937 rng(std::random_device{}());
+  const Node &node = arena.nodes[node_idx];
+  int total = 0;
+  for (U8 c = 0; c < node.num_children; ++c)
+    total += arena.nodes[node.first_child_idx + c].frozen_visits.load(
+        std::memory_order_relaxed);
+  if (total == 0) {
+    std::uniform_int_distribution<int> dist(0, node.num_children - 1);
+    return node.first_child_idx + dist(rng);
+  }
+  std::uniform_int_distribution<int> dist(0, total - 1);
+  int r = dist(rng);
+  int cumulative = 0;
+  for (U8 c = 0; c < node.num_children; ++c) {
+    cumulative += arena.nodes[node.first_child_idx + c].frozen_visits.load(
+        std::memory_order_relaxed);
+    if (r < cumulative)
+      return node.first_child_idx + c;
+  }
+  return node.first_child_idx + node.num_children - 1;
+}
+
+// Snapshot each child's current visit count into frozen_visits.
+static void freeze_children(TreeArena &arena, U32 node_idx) {
+  const Node &node = arena.nodes[node_idx];
+  for (U8 c = 0; c < node.num_children; ++c) {
+    Node &child = arena.nodes[node.first_child_idx + c];
+    int cv = child.visits.load(std::memory_order_relaxed);
+    child.frozen_visits.store(static_cast<U8>(cv), std::memory_order_relaxed);
+  }
+}
+
 int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
-                 const std::vector<U64> &game_hashes) {
+                 const std::vector<U64> &game_hashes, int nscl) {
   Position current_pos = root_pos;
   U32 current_idx = 0;
   std::vector<U32> search_path;
@@ -108,7 +144,14 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
 
   // SELECTION
   while (arena.nodes[current_idx].num_children > 0) {
-    U32 best_child_idx = select_best_puct(arena, current_idx);
+    U32 best_child_idx;
+    if (nscl > 0 && depth % 2 == 1 &&
+        arena.nodes[current_idx].visits.load(std::memory_order_relaxed) >
+            nscl) {
+      best_child_idx = sample_frozen_child(arena, current_idx);
+    } else {
+      best_child_idx = select_best_puct(arena, current_idx);
+    }
     current_pos.makemove(arena.nodes[best_child_idx].move);
     current_idx = best_child_idx;
     search_path.push_back(current_idx);
@@ -166,6 +209,8 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
                   std::memory_order_relaxed);
               arena.nodes[child_idx].virtual_visits.store(
                   0, std::memory_order_relaxed);
+              arena.nodes[child_idx].frozen_visits.store(
+                  0, std::memory_order_relaxed);
             }
 
             std::atomic_thread_fence(std::memory_order_release);
@@ -187,26 +232,36 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
   }
 
   // BACKPROPAGATION
-  for (int i = search_path.size() - 1; i >= 0; --i) {
+  for (int i = static_cast<int>(search_path.size()) - 1; i >= 0; --i) {
     U32 idx = search_path[i];
     if (i > 0) {
       arena.nodes[idx].virtual_visits.fetch_sub(1, std::memory_order_relaxed);
     }
-    arena.nodes[idx].visits.fetch_add(1, std::memory_order_relaxed);
+    int child_visits =
+        arena.nodes[idx].visits.fetch_add(1, std::memory_order_relaxed);
     arena.nodes[idx].value_sum.fetch_add(value, std::memory_order_relaxed);
+    if (nscl > 0 && i % 2 == 1 && child_visits == nscl &&
+        arena.nodes[idx].num_children > 0) {
+      freeze_children(arena, idx);
+    }
     value = -value;
   }
   return depth;
 }
 
-void mcts_backprop(TreeArena &arena, const std::vector<U32> &path,
-                   float value) {
+void mcts_backprop(TreeArena &arena, const std::vector<U32> &path, float value,
+                   int nscl) {
   for (int i = static_cast<int>(path.size()) - 1; i >= 0; --i) {
     U32 idx = path[i];
     if (i > 0)
       arena.nodes[idx].virtual_visits.fetch_sub(1, std::memory_order_relaxed);
-    arena.nodes[idx].visits.fetch_add(1, std::memory_order_relaxed);
+    int child_visits =
+        arena.nodes[idx].visits.fetch_add(1, std::memory_order_relaxed);
     arena.nodes[idx].value_sum.fetch_add(value, std::memory_order_relaxed);
+    if (nscl > 0 && i % 2 == 1 && child_visits == nscl &&
+        arena.nodes[idx].num_children > 0) {
+      freeze_children(arena, idx);
+    }
     value = -value;
   }
 }
@@ -214,7 +269,7 @@ void mcts_backprop(TreeArena &arena, const std::vector<U32> &path,
 int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
                 const Position &root_pos, const std::vector<U64> &game_hashes,
                 PendingRollout &pending, std::future<NNOutput> &out_future,
-                float &out_value) {
+                float &out_value, int nscl) {
   Position current_pos = root_pos;
   U32 current_idx = 0;
   pending.search_path.clear();
@@ -227,7 +282,14 @@ int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
 
   // SELECTION
   while (arena.nodes[current_idx].num_children > 0) {
-    U32 best_child = select_best_puct(arena, current_idx);
+    U32 best_child;
+    if (nscl > 0 && pending.depth % 2 == 1 &&
+        arena.nodes[current_idx].visits.load(std::memory_order_relaxed) >
+            nscl) {
+      best_child = sample_frozen_child(arena, current_idx);
+    } else {
+      best_child = select_best_puct(arena, current_idx);
+    }
     current_pos.makemove(arena.nodes[best_child].move);
     current_idx = best_child;
     pending.search_path.push_back(current_idx);
@@ -288,7 +350,7 @@ int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
 }
 
 void mcts_expand_and_backprop(TreeArena &arena, PendingRollout &pending,
-                              const NNOutput &raw_nn) {
+                              const NNOutput &raw_nn, int nscl) {
   MCTSEval processed = parse_nn_output(raw_nn, pending.moves, pending.movecount,
                                        pending.leaf_pos.stm);
   float value = processed.qscore;
@@ -308,11 +370,12 @@ void mcts_expand_and_backprop(TreeArena &arena, PendingRollout &pending,
       arena.nodes[child_idx].num_children = 0;
       arena.nodes[child_idx].is_expanding.clear(std::memory_order_relaxed);
       arena.nodes[child_idx].virtual_visits.store(0, std::memory_order_relaxed);
+      arena.nodes[child_idx].frozen_visits.store(0, std::memory_order_relaxed);
     }
     std::atomic_thread_fence(std::memory_order_release);
     arena.nodes[leaf_idx].first_child_idx = child_start;
     arena.nodes[leaf_idx].num_children = pending.movecount;
   }
 
-  mcts_backprop(arena, pending.search_path, value);
+  mcts_backprop(arena, pending.search_path, value, nscl);
 }
