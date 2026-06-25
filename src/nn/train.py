@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import optax
 from flax.training import train_state
 import time
+import math
 import orbax.checkpoint as ocp
 import glob
 
@@ -84,8 +85,9 @@ def train_step(state, batch):
     return state, loss, p_loss, v_loss, wdl_loss, q_loss
 
 # --- 3. The Main Training Engine ---
-def train(checkpoint_manager):
+def train(checkpoint_manager, visit_temperature=1.0):
     print("Initializing ShatranjNet Training...")
+    print(f"Visit temperature: {visit_temperature}")
     
     # 1. Standard Initialization
     key = jax.random.PRNGKey(42)
@@ -130,7 +132,11 @@ def train(checkpoint_manager):
     # Load files
     data_files = glob.glob("*.data")
     full_dataset = load_sparse_dataset(data_files)
-    dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=284)
+    dataloader = SparseInMemoryDataLoader(
+        dataset_dict=full_dataset,
+        batch_size=284,
+        visit_temperature=visit_temperature
+    )
     
     # --- DIAGNOSTIC CHECK ---
     # Get one single batch to test the network BEFORE the optimizer touches it
@@ -150,7 +156,11 @@ def train(checkpoint_manager):
     print("----------------------------\n")
     
     # Reset dataloader so we don't skip this batch
-    dataloader = SparseInMemoryDataLoader(dataset_dict=full_dataset, batch_size=284)
+    dataloader = SparseInMemoryDataLoader(
+        dataset_dict=full_dataset,
+        batch_size=284,
+        visit_temperature=visit_temperature
+    )
     
     batches = 300000
     local_step = 0
@@ -198,7 +208,16 @@ if __name__ == "__main__":
         default="./sz0_run2", 
         help="Path to the checkpoint directory for this training run (default: ./sz0_test_value)"
     )
+    parser.add_argument(
+        "--visit-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature applied to MCTS visit policy targets before training (default: 1.0)"
+    )
     args = parser.parse_args()
+
+    if not math.isfinite(args.visit_temperature) or args.visit_temperature < 0:
+        parser.error("--visit-temperature must be finite and non-negative")
 
     # Create an absolute path for your checkpoints using the argument
     ckpt_dir = os.path.abspath(args.run_dir)
@@ -211,4 +230,4 @@ if __name__ == "__main__":
         item_names=('state',)
     )
     
-    final_state = train(checkpoint_manager)
+    final_state = train(checkpoint_manager, visit_temperature=args.visit_temperature)

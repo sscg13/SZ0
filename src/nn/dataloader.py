@@ -88,10 +88,14 @@ def load_sparse_dataset(filepaths):
     }
 
 class SparseInMemoryDataLoader:
-    def __init__(self, dataset_dict, batch_size=284):
+    def __init__(self, dataset_dict, batch_size=284, visit_temperature=1.0):
+        if not np.isfinite(visit_temperature) or visit_temperature < 0:
+            raise ValueError("visit_temperature must be finite and non-negative")
+
         self.data = dataset_dict
         self.batch_size = batch_size
         self.total_samples = self.data['boards'].shape[0]
+        self.visit_temperature = visit_temperature
         
     def get_batches(self):
         # 1. Global permutation for the epoch
@@ -121,7 +125,27 @@ class SparseInMemoryDataLoader:
                 valid_mask = (m_indices >= 0) & (m_indices < 4096)
                 valid_indices = m_indices[valid_mask]
                 
-                dense_pi[batch_row, m_indices[valid_mask]] = m_probs[valid_mask]
+                valid_probs = m_probs[valid_mask]
+                if self.visit_temperature == 0:
+                    visit_target = np.zeros_like(valid_probs, dtype=np.float32)
+                    if len(visit_target) > 0:
+                        visit_target[np.argmax(valid_probs)] = 1.0
+                elif self.visit_temperature != 1.0:
+                    log_probs = np.log(np.maximum(valid_probs, np.finfo(np.float32).tiny))
+                    scaled_logits = log_probs / self.visit_temperature
+                    scaled_logits = scaled_logits - scaled_logits.max()
+                    visit_target = np.exp(scaled_logits).astype(np.float32)
+                    target_sum = visit_target.sum(dtype=np.float32)
+                    if target_sum > 0 and np.isfinite(target_sum):
+                        visit_target = visit_target / target_sum
+                    else:
+                        visit_target = np.zeros_like(valid_probs, dtype=np.float32)
+                        if len(visit_target) > 0:
+                            visit_target[np.argmax(valid_probs)] = 1.0
+                else:
+                    visit_target = valid_probs
+
+                dense_pi[batch_row, valid_indices] = visit_target
                 legal_mask[batch_row, valid_indices] = True
                 
             raw_boards = self.data['boards'][batch_idx].astype(np.int32)
