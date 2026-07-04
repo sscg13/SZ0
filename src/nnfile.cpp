@@ -40,7 +40,14 @@ void reload_network(const std::string &path) {
   nn.reset();
 
   try {
-    nn = std::make_unique<NNEvaluator>(path.c_str());
+    // Pin a symbolic batch dim to the size this build actually feeds the
+    // session: the search batch in batched builds, single positions
+    // otherwise. Fixed-batch exports are unaffected.
+#if defined(USE_CUDA) || defined(USE_BATCHED_SEARCH)
+    nn = std::make_unique<NNEvaluator>(path.c_str(), searchbatchsize);
+#else
+    nn = std::make_unique<NNEvaluator>(path.c_str(), 1);
+#endif
     std::cout << "info string Network loaded successfully.\n";
   } catch (const Ort::Exception &e) {
     std::cerr << "info string Error loading network: " << e.what() << "\n";

@@ -26,6 +26,9 @@ void uci() {
   reload_network(default_weights);
   int threadcount = 1;
   int search_contempt_nscl = 0;
+  bool particle_search = false;
+  bool particle_greedy = false;
+  int particle_eta_x100 = 150;
 
   while (std::getline(std::cin, ucicommand)) {
     std::stringstream tokens(ucicommand);
@@ -45,6 +48,11 @@ void uci() {
           << "option name WeightsFile type string default <autodiscover>\n"
           << "option name SearchContemptNodeLimit type spin default 0 min 0 "
              "max 255\n"
+          << "option name ParticleSearch type check default false\n"
+          << "option name ParticleEta type spin default 150 min 100 max "
+             "400\n"
+          << "option name ParticleGreedy type check default false\n"
+          << "option name CPuct type spin default 200 min 25 max 800\n"
           << "uciok\n";
     }
     if (token == "isready") {
@@ -127,8 +135,16 @@ void uci() {
         }
       }
       arena.clear();
+      // Greedy mode (eta = -1 sentinel) takes the argmax of the improved
+      // policy instead of sampling: same selection formula, no stochasticity
+      // or importance weights.
+      float particle_eta = 0.0f;
+      if (particle_search) {
+        particle_eta =
+            particle_greedy ? -1.0f : particle_eta_x100 / 100.0f;
+      }
       search_position(*nn, arena, current_pos, game_hashes, movetime, nodecount,
-                      threadcount, true, search_contempt_nscl);
+                      threadcount, true, search_contempt_nscl, particle_eta);
     }
     if (token == "setoption") {
       tokens >> token;
@@ -154,6 +170,26 @@ void uci() {
         tokens >> token;
         tokens >> token;
         search_contempt_nscl = std::clamp(std::stoi(token), 0, 255);
+      }
+      if (token == "ParticleSearch") {
+        tokens >> token;
+        tokens >> token;
+        particle_search = (token == "true");
+      }
+      if (token == "ParticleEta") {
+        tokens >> token;
+        tokens >> token;
+        particle_eta_x100 = std::clamp(std::stoi(token), 100, 400);
+      }
+      if (token == "ParticleGreedy") {
+        tokens >> token;
+        tokens >> token;
+        particle_greedy = (token == "true");
+      }
+      if (token == "CPuct") {
+        tokens >> token;
+        tokens >> token;
+        cpuct_value = std::clamp(std::stoi(token), 25, 800) / 100.0f;
       }
     }
     if (token == "eval") {
@@ -229,7 +265,7 @@ int main(int argc, char *argv[]) {
     std::cout << "Position target: " << num_positions << "\n";
     std::cout << "Data Output: " << outputfile << ".data\n";
 
-    NNEvaluator nn(default_weights.c_str());
+    NNEvaluator nn(default_weights.c_str(), datagenbatchsize);
     generate_batched_selfplay_games(nn, outputfile, node_limit, num_positions);
 
     return 0;

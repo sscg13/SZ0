@@ -82,15 +82,18 @@ void backprop(DatagenGame &game, float value) {
   for (int i = static_cast<int>(game.search_path.size()) - 1; i >= 0; --i) {
     U32 idx = game.search_path[i];
     Node &node = game.arena.nodes[idx];
-    int child_visits = node.visits.fetch_add(1, std::memory_order_relaxed);
+    float child_visits =
+        node.visits.fetch_add(1.0f, std::memory_order_relaxed);
     node.value_sum.fetch_add(value, std::memory_order_relaxed);
 
     // When an odd-depth (opponent) node first reaches N_scl visits, freeze each
     // child's current visit count for subsequent Thompson Sampling selection.
-    if (i % 2 == 1 && child_visits == contempt_nscl && node.num_children > 0) {
+    // Datagen backups always add exactly 1, so counts stay integral.
+    if (i % 2 == 1 && static_cast<int>(child_visits) == contempt_nscl &&
+        node.num_children > 0) {
       for (U8 c = 0; c < node.num_children; ++c) {
         Node &child = game.arena.nodes[node.first_child_idx + c];
-        int cv = child.visits.load(std::memory_order_relaxed);
+        int cv = static_cast<int>(child.visits.load(std::memory_order_relaxed));
         child.frozen_visits.store(static_cast<U8>(cv), std::memory_order_relaxed);
       }
     }
@@ -207,7 +210,7 @@ void expand(DatagenGame &game, const NNOutput &raw_nn) {
       size_t child_idx = child_start + i;
       game.arena.nodes[child_idx].move = moves[i];
       game.arena.nodes[child_idx].prior = processed.priors[i];
-      game.arena.nodes[child_idx].visits = 0;
+      game.arena.nodes[child_idx].visits = 0.0f;
       game.arena.nodes[child_idx].value_sum = 0.0f;
       game.arena.nodes[child_idx].first_child_idx = -1;
       game.arena.nodes[child_idx].num_children = 0;
@@ -372,7 +375,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             game_result = g.root_pos.stm ? 1 : -1;
             is_terminal = true;
           } else {
-            int total_child_visits = 0;
+            float total_child_visits = 0.0f;
             for (int c = 0; c < root.num_children; ++c) {
               total_child_visits +=
                   g.arena.nodes[root.first_child_idx + c].visits.load(
@@ -385,7 +388,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             train_pos.num_moves = root.num_children;
             train_pos.root_q =
                 root.value_sum.load(std::memory_order_relaxed) /
-                std::max(1, root.visits.load(std::memory_order_relaxed));
+                std::max(1.0f, root.visits.load(std::memory_order_relaxed));
 
             float temperature;
             if (g.ply_count < 60) {
@@ -395,10 +398,10 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             }
 
             int best_child_idx = 0;
-            int max_visits = -1;
+            float max_visits = -1.0f;
 
             for (int c = 0; c < root.num_children; ++c) {
-              int v = g.arena.nodes[root.first_child_idx + c].visits.load(
+              float v = g.arena.nodes[root.first_child_idx + c].visits.load(
                   std::memory_order_relaxed);
               if (v > max_visits) {
                 max_visits = v;
@@ -418,9 +421,9 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
               int to_sq = g.root_pos.stm ? (m.to() ^ 56) : m.to();
               train_pos.move_indices[c] = (from_sq * 64) + to_sq;
 
-              float visit_prob = static_cast<float>(child.visits.load(
-                                     std::memory_order_relaxed)) /
-                                 total_child_visits;
+              float visit_prob =
+                  child.visits.load(std::memory_order_relaxed) /
+                  total_child_visits;
               train_pos.move_probabilities[c] = visit_prob;
             }
 
@@ -431,18 +434,16 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
               float inv_temp = 1.0f / temperature;
               float sum_tempered = 0.0f;
               for (int c = 0; c < root.num_children; ++c) {
-                int v = g.arena.nodes[root.first_child_idx + c].visits.load(
+                float v = g.arena.nodes[root.first_child_idx + c].visits.load(
                     std::memory_order_relaxed);
-                sum_tempered +=
-                    std::pow(static_cast<float>(v) / max_visits, inv_temp);
+                sum_tempered += std::pow(v / max_visits, inv_temp);
               }
               float random_choice = prob_dist(rng) * sum_tempered;
               float cumulative = 0.0f;
               for (int c = 0; c < root.num_children; ++c) {
-                int v = g.arena.nodes[root.first_child_idx + c].visits.load(
+                float v = g.arena.nodes[root.first_child_idx + c].visits.load(
                     std::memory_order_relaxed);
-                cumulative +=
-                    std::pow(static_cast<float>(v) / max_visits, inv_temp);
+                cumulative += std::pow(v / max_visits, inv_temp);
                 if (random_choice <= cumulative) {
                   selected_move = g.arena.nodes[root.first_child_idx + c].move;
                   break;

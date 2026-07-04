@@ -11,7 +11,10 @@
 
 struct alignas(8) Node {
   U32 first_child_idx;
-  std::atomic<int> visits;
+  // Fractional: particle-MCTS backups add the particle's importance weight
+  // rather than 1. Classic PUCT backups add exactly 1.0f so counts stay
+  // integral in that mode.
+  std::atomic<float> visits;
   std::atomic<float> value_sum;
   float prior;
   std::atomic_flag is_expanding = ATOMIC_FLAG_INIT;
@@ -23,7 +26,7 @@ struct alignas(8) Node {
   std::atomic<U8> virtual_visits;
 
   Node()
-      : first_child_idx(-1), visits(0), value_sum(0.0f), prior(0.0f),
+      : first_child_idx(-1), visits(0.0f), value_sum(0.0f), prior(0.0f),
         frozen_visits(0), move(Move()), num_children(0), virtual_visits(0) {}
 };
 static_assert(sizeof(Node) == 24, "Node size must remain 24 bytes");
@@ -51,15 +54,31 @@ struct PendingRollout {
   Move moves[maxmoves];
   int movecount;
   int depth;
+  // Particle-MCTS importance weight accumulated during selection; 1.0 when
+  // particle mode is off.
+  float weight;
 };
 
 bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
                    const std::vector<U64> &rollout_hashes);
 U32 select_best_puct(const TreeArena &arena, U32 node_idx);
 
+// PUCT exploration constant used by select_best_puct (CPuct UCI option).
+extern float cpuct_value;
+
+// Particle MCTS (arXiv:2605.08982): particle_eta > 0 replaces deterministic
+// PUCT selection with sampling from a 1/eta-temperature-flattened improved
+// policy; each rollout carries the importance ratio pi/pi_hat as a weight
+// that scales its backup. Diversity across concurrent rollouts comes from
+// the sampling itself, so virtual visits are ignored during selection.
+// particle_eta == 0 gives the classic PUCT + virtual-visits search.
+// particle_eta < 0 is greedy mode: deterministic argmax of the improved
+// policy, no sampling or weights (for decomposition testing).
+
 // CPU path: monolithic rollout with a blocking NN call.
 int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
-                 const std::vector<U64> &game_hashes, int nscl = 0);
+                 const std::vector<U64> &game_hashes, int nscl = 0,
+                 float particle_eta = 0.0f);
 
 // GPU path — three-phase split so workers stay busy while the GPU runs.
 //
@@ -73,12 +92,14 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
 int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
                 const Position &root_pos, const std::vector<U64> &game_hashes,
                 PendingRollout &pending, std::future<NNOutput> &out_future,
-                float &out_value, int nscl = 0);
+                float &out_value, int nscl = 0, float particle_eta = 0.0f);
 
-// Expand the leaf's children from the NN result and backpropagate.
+// Expand the leaf's children from the NN result and backpropagate
+// (weighted by pending.weight).
 void mcts_expand_and_backprop(TreeArena &arena, PendingRollout &pending,
                               const NNOutput &raw_nn, int nscl = 0);
 
-// Propagate a value (terminal or cached) back along search_path.
+// Propagate a value (terminal or cached) back along search_path, adding
+// `weight` to visit counts and weight * value to value sums.
 void mcts_backprop(TreeArena &arena, const std::vector<U32> &path, float value,
-                   int nscl = 0);
+                   int nscl = 0, float weight = 1.0f);
