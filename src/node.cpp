@@ -111,20 +111,24 @@ static U32 sample_particle_child(const TreeArena &arena, U32 node_idx,
     for (int i = 0; i < n; ++i)
       sum_exp += std::exp(logits[i] - max_logit);
 
-    float total_child_visits = 0.0f;
-    for (int i = 0; i < n; ++i)
-      total_child_visits += arena.nodes[parent.first_child_idx + i].visits.load(
-          std::memory_order_relaxed);
+    // In-flight rollouts (virtual visits) count as visits so that
+    // concurrent selects spread deterministically across the improved
+    // policy instead of piling onto the same pending leaf. Single-threaded
+    // behavior is unchanged: virtual visits are zero there.
+    float counts[maxmoves];
+    float total_counts = 0.0f;
+    for (int i = 0; i < n; ++i) {
+      const Node &child = arena.nodes[parent.first_child_idx + i];
+      counts[i] = child.visits.load(std::memory_order_relaxed) +
+                  child.virtual_visits.load(std::memory_order_relaxed);
+      total_counts += counts[i];
+    }
 
     int best = 0;
     float best_score = -std::numeric_limits<float>::infinity();
     for (int i = 0; i < n; ++i) {
       float pi = std::exp(logits[i] - max_logit) / sum_exp;
-      float visit_frac =
-          arena.nodes[parent.first_child_idx + i].visits.load(
-              std::memory_order_relaxed) /
-          (1.0f + total_child_visits);
-      float score = pi - visit_frac;
+      float score = pi - counts[i] / (1.0f + total_counts);
       if (score > best_score) {
         best_score = score;
         best = i;

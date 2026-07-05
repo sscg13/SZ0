@@ -73,6 +73,7 @@ void printinfostring(const TreeArena &arena, int timetaken, int avgdepth,
 void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
                  std::vector<uint64_t> game_history, int nscl, float eta,
                  U64 nodelimit) {
+  bool collided = false;
   while (!stop_search.load(std::memory_order_relaxed)) {
     if (nodelimit > 0 &&
         started_rollouts.fetch_add(1, std::memory_order_relaxed) >=
@@ -80,7 +81,12 @@ void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
       stop_search.store(true, std::memory_order_relaxed);
       break;
     }
-    int depth = mcts_rollout(nn, arena, root_pos, game_history, nscl, eta);
+    // Deterministic selection retries the identical path after a collision
+    // (its virtual visits were rolled back), so break the tie with one
+    // sampled (eta = 1) rollout before returning to deterministic mode.
+    float sel_eta = (eta < 0.0f && collided) ? 1.0f : eta;
+    int depth = mcts_rollout(nn, arena, root_pos, game_history, nscl, sel_eta);
+    collided = (depth == 0);
     if (depth == 0) {
       if (nodelimit > 0)
         started_rollouts.fetch_sub(1, std::memory_order_relaxed);
@@ -108,6 +114,7 @@ void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
 
   std::vector<InFlight> in_flight;
   in_flight.reserve(max_in_flight);
+  bool collided = false;
 
   auto finish_rollout = [&](PendingRollout &pending) {
     int depth = pending.depth;
@@ -155,8 +162,13 @@ void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
       std::future<NNOutput> future;
       float value;
 
+      // After a collision, deterministic selection would retry the same
+      // path (its virtual visits were rolled back); break the tie with one
+      // sampled (eta = 1) selection before returning to deterministic mode.
+      float sel_eta = (eta < 0.0f && collided) ? 1.0f : eta;
       int outcome = mcts_select(batch_eval, arena, root_pos, game_history,
-                                pending, future, value, nscl, eta);
+                                pending, future, value, nscl, sel_eta);
+      collided = (outcome == 0);
 
       if (outcome == 2) {
         in_flight.push_back({std::move(pending), std::move(future)});
