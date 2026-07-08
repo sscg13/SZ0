@@ -49,7 +49,10 @@ public:
     session_options.SetGraphOptimizationLevel(
         GraphOptimizationLevel::ORT_ENABLE_ALL);
     if (fixed_batch > 0) {
-      session_options.AddFreeDimensionOverrideByName("batch", fixed_batch);
+      // Older ORT C++ headers lack the SessionOptions wrapper for this, so
+      // call the C API directly (same pattern as the CUDA options below).
+      Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(
+          session_options, "batch", fixed_batch));
     }
     // session_options.EnableProfiling("shatranj_profile.json");
 
