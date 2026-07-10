@@ -340,7 +340,9 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
                                                     std::memory_order_relaxed);
         }
       }
-      return 0;
+      // -1, not 0: a successful root expansion legitimately returns depth 0,
+      // so 0 cannot double as the collision signal.
+      return -1;
     }
   }
 

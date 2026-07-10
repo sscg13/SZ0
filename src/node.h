@@ -76,6 +76,8 @@ extern float cpuct_value;
 // policy, no sampling or weights (for decomposition testing).
 
 // CPU path: monolithic rollout with a blocking NN call.
+// Returns the leaf depth on success (0 for the root expansion), or -1 on a
+// collision (another thread was expanding the leaf; the path is cleaned up).
 int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
                  const std::vector<U64> &game_hashes, int nscl = 0,
                  float particle_eta = 0.0f);

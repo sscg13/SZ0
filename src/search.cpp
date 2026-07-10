@@ -86,8 +86,8 @@ void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
     // sampled (eta = 1) rollout before returning to deterministic mode.
     float sel_eta = (eta < 0.0f && collided) ? 1.0f : eta;
     int depth = mcts_rollout(nn, arena, root_pos, game_history, nscl, sel_eta);
-    collided = (depth == 0);
-    if (depth == 0) {
+    collided = (depth < 0);
+    if (depth < 0) {
       if (nodelimit > 0)
         started_rollouts.fetch_sub(1, std::memory_order_relaxed);
       leaf_collisions.fetch_add(1, std::memory_order_relaxed);
@@ -305,14 +305,17 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
   auto elapsed =
       std::chrono::duration_cast<std::chrono::milliseconds>(now - start)
           .count();
+  U64 final_rollouts = total_rollouts.load(std::memory_order_relaxed);
   if (print_info) {
-    printinfostring(arena, elapsed,
-                    depthsum.load(std::memory_order_relaxed) /
-                        total_rollouts.load(std::memory_order_relaxed),
-                    seldepth.load(std::memory_order_relaxed));
-    std::cout << "info string rollouts "
-              << total_rollouts.load(std::memory_order_relaxed)
-              << " collisions "
+    // Guard the division: a very short time limit can stop the search
+    // before the first rollout completes.
+    if (final_rollouts > 0) {
+      printinfostring(arena, elapsed,
+                      depthsum.load(std::memory_order_relaxed) /
+                          final_rollouts,
+                      seldepth.load(std::memory_order_relaxed));
+    }
+    std::cout << "info string rollouts " << final_rollouts << " collisions "
               << leaf_collisions.load(std::memory_order_relaxed) << "\n";
   }
   Move best = get_best_move(arena);

@@ -33,6 +33,8 @@ std::string get_latest_onnx_file(const std::string &directory) {
 
 void reload_network(const std::string &path) {
   if (path == "<empty>") {
+    std::cout << "info string WARNING: no .onnx file found in working "
+                 "directory, no network loaded\n";
     return;
   }
 
@@ -50,6 +52,8 @@ void reload_network(const std::string &path) {
 #endif
     std::cout << "info string Network loaded successfully.\n";
   } catch (const Ort::Exception &e) {
-    std::cerr << "info string Error loading network: " << e.what() << "\n";
+    // stdout, not stderr: GUIs/cutechess only log the UCI stream, so a
+    // stderr-only error leaves no trace of why the engine has no network.
+    std::cout << "info string Error loading network: " << e.what() << "\n";
   }
 }
