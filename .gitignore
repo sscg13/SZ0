@@ -1,0 +1,15 @@
+# Build artifacts
+*.exe
+*.o
+SZ0
+
+# ONNX Runtime redistributables and local runtime dir
+*.dll
+onnx/
+
+# Model files and datagen output
+*.onnx
+*.data
+
+# Python
+__pycache__/

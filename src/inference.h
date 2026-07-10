@@ -34,7 +34,12 @@ class NNEvaluator {
   std::vector<const char *> output_names = {"policy", "value"};
 
 public:
-  NNEvaluator(const char *model_path)
+  // fixed_batch > 0 pins a symbolic batch dimension named "batch" (if the
+  // model has one) to that size before the session is created, so ORT
+  // optimizes the graph as fully static — fusions, memory planning, and CUDA
+  // graph capture behave as with a fixed-batch export. Models with
+  // hard-coded batch dims are unaffected (the override matches nothing).
+  NNEvaluator(const char *model_path, int fixed_batch = 0)
       : env(ORT_LOGGING_LEVEL_WARNING, "ShatranjZer0"),
         memory_info(
             Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
@@ -43,6 +48,12 @@ public:
     session_options.SetInterOpNumThreads(1);
     session_options.SetGraphOptimizationLevel(
         GraphOptimizationLevel::ORT_ENABLE_ALL);
+    if (fixed_batch > 0) {
+      // Older ORT C++ headers lack the SessionOptions wrapper for this, so
+      // call the C API directly (same pattern as the CUDA options below).
+      Ort::ThrowOnError(Ort::GetApi().AddFreeDimensionOverrideByName(
+          session_options, "batch", fixed_batch));
+    }
     // session_options.EnableProfiling("shatranj_profile.json");
 
 #ifdef USE_CUDA
@@ -85,6 +96,14 @@ public:
     // Linux uses standard char arrays
     session = Ort::Session(env, model_path, session_options);
 #endif
+
+    // Warm the session with one dummy batch so provider autotuning (cuDNN /
+    // cuBLAS algorithm selection) and arena allocation happen at load time,
+    // not on the clock during the first timed search.
+    int warm_batch = (fixed_batch > 0) ? fixed_batch : 1;
+    std::vector<int32_t> warm_pieces(static_cast<size_t>(warm_batch) * 64, 0);
+    std::vector<int32_t> warm_halfmoves(warm_batch, 0);
+    infer_dynamic_batch(warm_pieces, warm_halfmoves, warm_batch);
   }
 
   NNOutput infer(const Position &pos);

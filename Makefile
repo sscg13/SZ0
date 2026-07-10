@@ -3,6 +3,9 @@ ARCH := native
 TUNE := native
 DEBUG := no
 GPU := yes
+# BATCH=yes builds the batched (in-flight rollout) search pipeline without
+# CUDA, so GPU-level batching behavior can be tested with CPU inference.
+BATCH := no
 SUFFIX :=
 
 ifeq ($(OS), Windows_NT)
@@ -43,6 +46,10 @@ ifeq ($(GPU), yes)
     CXXFLAGS += -DUSE_CUDA
     INCLUDES += -I$(CUDNN_DIR)/include
     LDFLAGS  += -L$(CUDNN_DIR)/lib64 -Wl,-rpath,$(ONNX_DIR)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib
+endif
+
+ifeq ($(BATCH), yes)
+    CXXFLAGS += -DUSE_BATCHED_SEARCH
 endif
 
 OUT := $(EXE)$(SUFFIX)

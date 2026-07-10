@@ -26,6 +26,9 @@ void uci() {
   reload_network(default_weights);
   int threadcount = 1;
   int search_contempt_nscl = 0;
+  bool particle_search = true;
+  bool particle_greedy = true;
+  int particle_eta_x100 = 150;
 
   while (std::getline(std::cin, ucicommand)) {
     std::stringstream tokens(ucicommand);
@@ -45,6 +48,11 @@ void uci() {
           << "option name WeightsFile type string default <autodiscover>\n"
           << "option name SearchContemptNodeLimit type spin default 0 min 0 "
              "max 255\n"
+          << "option name ParticleSearch type check default true\n"
+          << "option name ParticleEta type spin default 150 min 100 max "
+             "400\n"
+          << "option name ParticleGreedy type check default true\n"
+          << "option name CPuct type spin default 200 min 25 max 800\n"
           << "uciok\n";
     }
     if (token == "isready") {
@@ -126,9 +134,23 @@ void uci() {
           movetime = (ourtime + 35 * ourinc) / 40;
         }
       }
+      if (!nn) {
+        std::cout << "info string ERROR: no network loaded, cannot search "
+                     "(set WeightsFile or put a .onnx in the working "
+                     "directory)\n";
+        continue;
+      }
       arena.clear();
+      // Greedy mode (eta = -1 sentinel) takes the argmax of the improved
+      // policy instead of sampling: same selection formula, no stochasticity
+      // or importance weights.
+      float particle_eta = 0.0f;
+      if (particle_search) {
+        particle_eta =
+            particle_greedy ? -1.0f : particle_eta_x100 / 100.0f;
+      }
       search_position(*nn, arena, current_pos, game_hashes, movetime, nodecount,
-                      threadcount, true, search_contempt_nscl);
+                      threadcount, true, search_contempt_nscl, particle_eta);
     }
     if (token == "setoption") {
       tokens >> token;
@@ -155,11 +177,44 @@ void uci() {
         tokens >> token;
         search_contempt_nscl = std::clamp(std::stoi(token), 0, 255);
       }
+      if (token == "ParticleSearch") {
+        tokens >> token;
+        tokens >> token;
+        particle_search = (token == "true");
+      }
+      if (token == "ParticleEta") {
+        tokens >> token;
+        tokens >> token;
+        particle_eta_x100 = std::clamp(std::stoi(token), 100, 400);
+      }
+      if (token == "ParticleGreedy") {
+        tokens >> token;
+        tokens >> token;
+        particle_greedy = (token == "true");
+      }
+      if (token == "CPuct") {
+        tokens >> token;
+        tokens >> token;
+        cpuct_value = std::clamp(std::stoi(token), 25, 800) / 100.0f;
+      }
     }
     if (token == "eval") {
+      if (!nn) {
+        std::cout << "info string ERROR: no network loaded, cannot eval\n";
+        continue;
+      }
       Move moves[maxmoves];
       int movecount = current_pos.generatemoves(moves);
-      NNOutput raw_nn = nn->infer(current_pos);
+      NNOutput raw_nn;
+      try {
+        raw_nn = nn->infer(current_pos);
+      } catch (const Ort::Exception &e) {
+        // Batched builds pin the session's batch dim to searchbatchsize, so
+        // the batch-1 eval path is rejected by ORT instead of crashing us.
+        std::cout << "info string ERROR: eval inference failed: " << e.what()
+                  << "\n";
+        continue;
+      }
       MCTSEval processed =
           parse_nn_output(raw_nn, moves, movecount, current_pos.stm);
 
@@ -217,8 +272,6 @@ int main(int argc, char *argv[]) {
       return 0;
     }
 
-    reload_network(default_weights);
-
     int num_positions = atoi(argv[2]);
     int node_limit = atoi(argv[3]);
     std::string outputfile(argv[4]);
@@ -229,8 +282,15 @@ int main(int argc, char *argv[]) {
     std::cout << "Position target: " << num_positions << "\n";
     std::cout << "Data Output: " << outputfile << ".data\n";
 
-    NNEvaluator nn(default_weights.c_str());
-    generate_batched_selfplay_games(nn, outputfile, node_limit, num_positions);
+    try {
+      NNEvaluator nn(default_weights.c_str(), datagenbatchsize);
+      generate_batched_selfplay_games(nn, outputfile, node_limit,
+                                      num_positions);
+    } catch (const Ort::Exception &e) {
+      std::cerr << "Error loading network " << default_weights << " at batch "
+                << datagenbatchsize << ": " << e.what() << "\n";
+      return 1;
+    }
 
     return 0;
   } else {
