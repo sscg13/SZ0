@@ -42,6 +42,12 @@ else
 	CFLAGS := -g -march=$(ARCH) -mtune=$(TUNE)
 endif
 
+# Track header dependencies so edits to consts.h etc. trigger recompiles;
+# without this a header change silently links stale objects.
+CXXFLAGS += -MMD -MP
+CFLAGS += -MMD -MP
+DEPS := $(OBJS:.o=.d)
+
 ifeq ($(GPU), yes)
     CXXFLAGS += -DUSE_CUDA
     INCLUDES += -I$(CUDNN_DIR)/include
@@ -65,4 +71,6 @@ $(EXE): $(OBJS)
 	@echo "Build complete. Run with ./$(OUT)"
 
 clean:
-	rm -f $(OBJS)
+	rm -f $(OBJS) $(DEPS)
+
+-include $(DEPS)

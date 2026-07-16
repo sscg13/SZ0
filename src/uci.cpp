@@ -276,6 +276,10 @@ int main(int argc, char *argv[]) {
     int node_limit = atoi(argv[3]);
     std::string outputfile(argv[4]);
 
+    // Datagen never receives setoption; pin its PUCT constant here (matches
+    // tested best c=1.0 rather than the 2.0 gameplay-option default).
+    cpuct_value = 1.0f;
+
     std::cout << "Starting Data Generation Engine...\n";
     std::cout << "Using weights file: " << default_weights << "\n";
     std::cout << "Nodes/Move: " << node_limit << "\n";
