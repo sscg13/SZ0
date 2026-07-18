@@ -333,13 +333,7 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
         }
       }
     } else {
-      for (int i = search_path.size() - 1; i >= 0; --i) {
-        U32 idx = search_path[i];
-        if (i > 0) {
-          arena.nodes[idx].virtual_visits.fetch_sub(1,
-                                                    std::memory_order_relaxed);
-        }
-      }
+      rollback_virtual_visits(arena, search_path);
       // -1, not 0: a successful root expansion legitimately returns depth 0,
       // so 0 cannot double as the collision signal.
       return -1;
@@ -352,11 +346,12 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
 }
 
 void mcts_backprop(TreeArena &arena, const std::vector<U32> &path, float value,
-                   int nscl, float weight) {
+                   int nscl, float weight, int multiplicity) {
   for (int i = static_cast<int>(path.size()) - 1; i >= 0; --i) {
     U32 idx = path[i];
     if (i > 0)
-      arena.nodes[idx].virtual_visits.fetch_sub(1, std::memory_order_relaxed);
+      arena.nodes[idx].virtual_visits.fetch_sub(
+          static_cast<U8>(multiplicity), std::memory_order_relaxed);
     float child_visits =
         arena.nodes[idx].visits.fetch_add(weight, std::memory_order_relaxed);
     arena.nodes[idx].value_sum.fetch_add(weight * value,
@@ -386,6 +381,7 @@ int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
   pending.rollout_hashes.push_back(current_pos.zobristhash);
   pending.depth = 0;
   pending.weight = 1.0f;
+  pending.multiplicity = 1;
 
   // SELECTION
   while (arena.nodes[current_idx].num_children > 0) {
@@ -452,11 +448,16 @@ int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
     return 2;
   }
 
-  // Collision: another thread is expanding this leaf. Clean up virtual visits.
-  for (int i = static_cast<int>(pending.search_path.size()) - 1; i > 0; --i)
-    arena.nodes[pending.search_path[i]].virtual_visits.fetch_sub(
-        1, std::memory_order_relaxed);
+  // Collision: another rollout is expanding this leaf. The virtual visits
+  // stay in place — the caller merges this particle into the owner or calls
+  // rollback_virtual_visits to discard it.
   return 0;
+}
+
+void rollback_virtual_visits(TreeArena &arena, const std::vector<U32> &path) {
+  for (int i = static_cast<int>(path.size()) - 1; i > 0; --i)
+    arena.nodes[path[i]].virtual_visits.fetch_sub(1,
+                                                  std::memory_order_relaxed);
 }
 
 void mcts_expand_and_backprop(TreeArena &arena, PendingRollout &pending,
@@ -487,5 +488,6 @@ void mcts_expand_and_backprop(TreeArena &arena, PendingRollout &pending,
     arena.nodes[leaf_idx].num_children = pending.movecount;
   }
 
-  mcts_backprop(arena, pending.search_path, value, nscl, pending.weight);
+  mcts_backprop(arena, pending.search_path, value, nscl, pending.weight,
+                pending.multiplicity);
 }

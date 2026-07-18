@@ -26,6 +26,9 @@ std::atomic<U64> depthsum(0);
 // Rollouts discarded because another thread was already expanding the same
 // leaf. Diagnostic for comparing virtual-visit vs particle selection.
 std::atomic<U64> leaf_collisions(0);
+// Collisions folded into the owning in-flight rollout instead of discarded
+// (ParticleMerge): the shared evaluation backs up with summed weight.
+std::atomic<U64> leaf_merges(0);
 
 template <typename T> void atomic_fetch_max(std::atomic<T> &obj, T val) {
   T prev = obj.load(std::memory_order_relaxed);
@@ -106,7 +109,8 @@ void mcts_worker(NNEvaluator &nn, TreeArena &arena, Position root_pos,
 #else
 void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
                  Position root_pos, std::vector<uint64_t> game_history,
-                 int max_in_flight, int nscl, float eta, U64 nodelimit) {
+                 int max_in_flight, int nscl, float eta, U64 nodelimit,
+                 bool merge_collisions) {
   struct InFlight {
     PendingRollout pending;
     std::future<NNOutput> future;
@@ -118,13 +122,15 @@ void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
 
   auto finish_rollout = [&](PendingRollout &pending) {
     int depth = pending.depth;
-    total_rollouts.fetch_add(1, std::memory_order_relaxed);
+    // A merged rollout completes every particle folded into it.
+    total_rollouts.fetch_add(pending.multiplicity, std::memory_order_relaxed);
     if (arena.active_nodes.load(std::memory_order_relaxed) >=
         arena.max_nodes - 256) {
       stop_search.store(true, std::memory_order_relaxed);
     }
     atomic_fetch_max(seldepth, depth);
-    depthsum.fetch_add(depth, std::memory_order_relaxed);
+    depthsum.fetch_add(static_cast<U64>(depth) * pending.multiplicity,
+                       std::memory_order_relaxed);
   };
 
   while (!stop_search.load(std::memory_order_relaxed)) {
@@ -168,7 +174,7 @@ void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
       float sel_eta = (eta < 0.0f && collided) ? 1.0f : eta;
       int outcome = mcts_select(batch_eval, arena, root_pos, game_history,
                                 pending, future, value, nscl, sel_eta);
-      collided = (outcome == 0);
+      collided = false; // set below only for an unmerged collision
 
       if (outcome == 2) {
         in_flight.push_back({std::move(pending), std::move(future)});
@@ -176,10 +182,44 @@ void mcts_worker(BatchEvaluator &batch_eval, TreeArena &arena,
         mcts_backprop(arena, pending.search_path, value, nscl, pending.weight);
         finish_rollout(pending);
       } else {
-        // outcome == 0 (collision): discard and retry next iteration.
-        if (nodelimit > 0)
-          started_rollouts.fetch_sub(1, std::memory_order_relaxed);
-        leaf_collisions.fetch_add(1, std::memory_order_relaxed);
+        // outcome == 0 (collision): the leaf is owned by an in-flight
+        // rollout. With merging, fold this particle into the owner — same
+        // leaf in a tree means the identical root path, so its virtual
+        // visits stay in place and convert to real visits when the shared
+        // evaluation returns. The ticket stays claimed (counted at
+        // completion via multiplicity), and the tree state has advanced,
+        // so deterministic selection needs no sampled tie-break.
+        // Cap how many particles one evaluation can absorb. Merging is
+        // self-limiting where selection has alternatives (each merge adds a
+        // virtual visit along the path, shrinking the visit-matching
+        // deficit), but a childless root or a forced line has nowhere else
+        // to steer and would swallow the entire node budget into one eval.
+        // The cap also bounds per-node virtual-visit mass (in-flight x cap)
+        // below the atomic<U8> range.
+        constexpr int max_merge_multiplicity = 4;
+        bool merged = false;
+        if (merge_collisions) {
+          U32 leaf = pending.search_path.back();
+          for (auto &item : in_flight) {
+            if (item.pending.search_path.back() == leaf &&
+                item.pending.multiplicity < max_merge_multiplicity) {
+              item.pending.weight += pending.weight;
+              item.pending.multiplicity += pending.multiplicity;
+              leaf_merges.fetch_add(1, std::memory_order_relaxed);
+              merged = true;
+              break;
+            }
+          }
+        }
+        if (!merged) {
+          // Owner belongs to another worker (or merging is off): discard
+          // and retry next iteration.
+          rollback_virtual_visits(arena, pending.search_path);
+          if (nodelimit > 0)
+            started_rollouts.fetch_sub(1, std::memory_order_relaxed);
+          leaf_collisions.fetch_add(1, std::memory_order_relaxed);
+        }
+        collided = !merged;
       }
     } else {
       // All slots are full (or the node budget is spent) and no future is
@@ -220,19 +260,24 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
                      const Position &current_pos,
                      const std::vector<uint64_t> &game_hashes, int timelimit,
                      U64 nodelimit, int threadcount, bool print_info,
-                     int contempt_nscl, float particle_eta) {
+                     int contempt_nscl, float particle_eta,
+                     bool particle_merge) {
   stop_search.store(false, std::memory_order_relaxed);
   total_rollouts.store(0, std::memory_order_relaxed);
   started_rollouts.store(0, std::memory_order_relaxed);
   seldepth.store(0, std::memory_order_relaxed);
   depthsum.store(0, std::memory_order_relaxed);
   leaf_collisions.store(0, std::memory_order_relaxed);
+  leaf_merges.store(0, std::memory_order_relaxed);
   arena.clear();
 
   // The interaction between particle selection and search-contempt Thompson
-  // Sampling is unexplored; contempt takes precedence for now.
+  // Sampling is unexplored; contempt takes precedence for now. Merging is
+  // also disabled: a merged backup adds several visits in one fetch_add,
+  // which would skip the exact-equality freeze trigger.
   if (contempt_nscl > 0) {
     particle_eta = 0.0f;
+    particle_merge = false;
   }
 
 #ifdef BATCHED_SEARCH
@@ -252,7 +297,8 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
 #ifdef BATCHED_SEARCH
     threads.emplace_back(mcts_worker, std::ref(batch_eval), std::ref(arena),
                          current_pos, game_hashes, max_in_flight,
-                         contempt_nscl, particle_eta, nodelimit);
+                         contempt_nscl, particle_eta, nodelimit,
+                         particle_merge);
 #else
     threads.emplace_back(mcts_worker, std::ref(nn), std::ref(arena),
                          current_pos, game_hashes, contempt_nscl,
@@ -316,7 +362,8 @@ void search_position(NNEvaluator &nn, TreeArena &arena,
                       seldepth.load(std::memory_order_relaxed));
     }
     std::cout << "info string rollouts " << final_rollouts << " collisions "
-              << leaf_collisions.load(std::memory_order_relaxed) << "\n";
+              << leaf_collisions.load(std::memory_order_relaxed) << " merges "
+              << leaf_merges.load(std::memory_order_relaxed) << "\n";
   }
   Move best = get_best_move(arena);
   if (best == Move()) {

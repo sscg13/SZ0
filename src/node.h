@@ -55,8 +55,14 @@ struct PendingRollout {
   int movecount;
   int depth;
   // Particle-MCTS importance weight accumulated during selection; 1.0 when
-  // particle mode is off.
+  // particle mode is off. Collision merging accumulates the merged
+  // particles' weights here.
   float weight;
+  // Number of particles folded into this rollout (1 + merged collisions).
+  // Each contributed one virtual visit along the shared path, so backprop
+  // removes `multiplicity` virtual visits and the completion accounting
+  // counts `multiplicity` rollouts.
+  int multiplicity;
 };
 
 bool is_repetition(const Position &pos, const std::vector<U64> &game_hashes,
@@ -85,8 +91,11 @@ int mcts_rollout(NNEvaluator &nn, TreeArena &arena, const Position &root_pos,
 // GPU path — three-phase split so workers stay busy while the GPU runs.
 //
 // Walk the tree to a leaf and decide what to do:
-//   Returns 0  — collision: another thread is already expanding this leaf.
-//                Discard and retry; the path has been cleaned up.
+//   Returns 0  — collision: another rollout is already expanding this leaf.
+//                pending.search_path is valid and its virtual visits are
+//                still in place: the caller must either merge this particle
+//                into the owning in-flight rollout (weight + multiplicity)
+//                or call rollback_virtual_visits and discard.
 //   Returns 1  — terminal: value is written to out_value.
 //                Call mcts_backprop(arena, pending.search_path, out_value).
 //   Returns 2  — needs NN: pending and out_future are valid.
@@ -96,12 +105,18 @@ int mcts_select(BatchEvaluator &batch_eval, TreeArena &arena,
                 PendingRollout &pending, std::future<NNOutput> &out_future,
                 float &out_value, int nscl = 0, float particle_eta = 0.0f);
 
+// Remove the virtual visits a selection placed along path (root excluded).
+void rollback_virtual_visits(TreeArena &arena, const std::vector<U32> &path);
+
 // Expand the leaf's children from the NN result and backpropagate
-// (weighted by pending.weight).
+// (weighted by pending.weight, removing pending.multiplicity virtual
+// visits per node).
 void mcts_expand_and_backprop(TreeArena &arena, PendingRollout &pending,
                               const NNOutput &raw_nn, int nscl = 0);
 
 // Propagate a value (terminal or cached) back along search_path, adding
-// `weight` to visit counts and weight * value to value sums.
+// `weight` to visit counts and weight * value to value sums. `multiplicity`
+// is how many selection passes placed virtual visits on this path (merged
+// particles share one backprop).
 void mcts_backprop(TreeArena &arena, const std::vector<U32> &path, float value,
-                   int nscl = 0, float weight = 1.0f);
+                   int nscl = 0, float weight = 1.0f, int multiplicity = 1);

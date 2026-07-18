@@ -28,6 +28,7 @@ void uci() {
   int search_contempt_nscl = 0;
   bool particle_search = true;
   bool particle_greedy = true;
+  bool particle_merge = false;
   int particle_eta_x100 = 150;
 
   while (std::getline(std::cin, ucicommand)) {
@@ -52,6 +53,7 @@ void uci() {
           << "option name ParticleEta type spin default 150 min 100 max "
              "400\n"
           << "option name ParticleGreedy type check default true\n"
+          << "option name ParticleMerge type check default false\n"
           << "option name CPuct type spin default 200 min 25 max 800\n"
           << "uciok\n";
     }
@@ -150,7 +152,8 @@ void uci() {
             particle_greedy ? -1.0f : particle_eta_x100 / 100.0f;
       }
       search_position(*nn, arena, current_pos, game_hashes, movetime, nodecount,
-                      threadcount, true, search_contempt_nscl, particle_eta);
+                      threadcount, true, search_contempt_nscl, particle_eta,
+                      particle_merge);
     }
     if (token == "setoption") {
       tokens >> token;
@@ -191,6 +194,11 @@ void uci() {
         tokens >> token;
         tokens >> token;
         particle_greedy = (token == "true");
+      }
+      if (token == "ParticleMerge") {
+        tokens >> token;
+        tokens >> token;
+        particle_merge = (token == "true");
       }
       if (token == "CPuct") {
         tokens >> token;
