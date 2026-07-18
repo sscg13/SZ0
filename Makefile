@@ -58,12 +58,17 @@ ifeq ($(BATCH), yes)
     CXXFLAGS += -DUSE_BATCHED_SEARCH
 endif
 
+# Rebuild all objects when the compile flags change (GPU / BATCH / DEBUG
+# flips) — same .cpp, different code. Must sit below every CXXFLAGS +=.
+FLAGSTAMP := .buildflags
+$(shell [ "$$(cat $(FLAGSTAMP) 2>/dev/null)" = "$(CXXFLAGS)" ] || echo "$(CXXFLAGS)" > $(FLAGSTAMP))
+
 OUT := $(EXE)$(SUFFIX)
 
-%.o: %.cpp
+%.o: %.cpp $(FLAGSTAMP)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-%.o: %.c
+%.o: %.c $(FLAGSTAMP)
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(EXE): $(OBJS)
@@ -71,6 +76,6 @@ $(EXE): $(OBJS)
 	@echo "Build complete. Run with ./$(OUT)"
 
 clean:
-	rm -f $(OBJS) $(DEPS)
+	rm -f $(OBJS) $(DEPS) $(FLAGSTAMP)
 
 -include $(DEPS)
