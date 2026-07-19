@@ -19,9 +19,30 @@ Older tests have been using double back row randomization, newer tests use an un
 
 Open follow-ups:
 
-- try merging duplicate collisions (~42% of traversals discarded at batch 32)
 - more GPU tests (possibly higher time control)
 - investigate whether most of the gain is attributed to Gumbel alone
+
+### Batch size 64
+
+Increased nps from 40k at batch size 32 to 50k, but was neutral in 100 games H2H.
+
+### Collision merging (ParticleMerge) — negative result
+
+Fold colliding rollouts into the owning in-flight evaluation (summed weight,
+multiplicity capped at 4 per eval) instead of discard-and-retry.
+Branch `particle-merge`, UCI check `ParticleMerge`, off by default.
+
+Setup: 6 sec + 0.1 sec increment, batch 32, 200 games head-to-head vs base greedy.
+
+| Engine | Elo |
+|---|---|
+| merge | −10.4 ± 32.3 (LOS 26.4%) |
+
+Merging engages rarely (startpos probe: 351 merges / 50K collisions / 169K
+rollouts) because visit-matching selection already counts in-flight virtual
+visits and steers around pending leaves. Retained virtual visits do cut
+collision spin ~33% (75K → 50K), but that saves worker CPU, not GPU
+throughput, so Elo is neutral. 
 
 ### GPU time-control particle vs PUCT
 

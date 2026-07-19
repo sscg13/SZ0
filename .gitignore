@@ -1,6 +1,8 @@
 # Build artifacts
 *.exe
 *.o
+*.d
+.buildflags
 SZ0
 
 # ONNX Runtime redistributables and local runtime dir
