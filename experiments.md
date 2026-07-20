@@ -11,6 +11,9 @@ Testing environment notes:
 Tests typically use either fixed-node or time control (6 sec, 0.1-0.5 sec increment).
 Older tests have been using double back row randomization, newer tests use an unbalanced opening book.
 
+Matches with access to raw cutechess logs are rescored with
+[testing/pentanomial.py](testing/pentanomial.py), as games are played in pairs.
+
 ---
 
 # Search
@@ -129,6 +132,77 @@ Open follow-ups:
 
 Naive dynamic exports are up to ~10× slower on CUDA (reshape overhead).
 The fix loads the dynamic export and optimizes it for constant batch size at runtime.
+
+## sz0_run4
+
+Fresh trains from scratch on the accumulated window, not iteratively refined.
+127.5M positions (recent sliding window, older deleted); 1.8M steps × batch 284
+≈ 4 epochs; ~10 h at 6 blocks, ~13.5 h at 10. `baseline` is the 6-block fresh
+train.
+
+Open follow-ups:
+
+- increase data window and/or train longer (confounded — see below)
+- `d_ff` 256 → 384 (Leela's 1.5× ratio) or 512 (2×)
+- widen `d_model` — raise arithmetic intensity
+- more optimizations (fusing? Cuda graph?)
+
+### The baseline anchor is ~67 Elo below the iterative net
+
+100 games, paired openings, fresh 6-block vs `run3_epoch28`:
+**−66.8 ± 36.4** pentanomial (−66.8 ± 49.2 trinomial), LOS 0.01%.
+
+Likely insufficient data — loss saturates ~4 epochs in, slightly above
+run3_epoch28's. But the gap is confounded between cumulative steps (8.4M vs
+1.8M) and cumulative unique positions (epoch28 saw a shifting window). Working
+estimate ~150-200M positions to match; untested.
+
+This gap is a major reason why comparisons are among fresh nets only.
+
+### 6 → 10 transformer blocks — adopted
+
+200 games head-to-head, paired openings, batch 32 fp16:
+
+| Test | Score | Trinomial | Pentanomial | LOS |
+|---|---|---|---|---|
+| 6 sec + 0.1 sec | 0.5275 | +19.1 ± 31.2 | +19.1 ± 25.7 | 92.9% |
+| 5000 nodes/move | 0.5475 | +33.1 ± 34.4 | **+33.1 ± 24.8** | 99.6% |
+
+Fixed node isolates evaluation quality, TC nets it against the speed loss; the
+~14 Elo gap is the cost of 25% fewer nodes.
+
+| Regime | Batch | nps 6 → 10 | Slowdown | Estimated overhead |
+|---|---|---|---|---|
+| Search | 32 | 40K → 30K | 1.33× | ~50% |
+| Datagen | 284 | 95K → 59K | 1.61× | ~8% |
+
+Adopted despite TC falling short of significance: datagen is fixed-node, so the
+relevant figure is +33 against 38% fewer positions per hour. Caveats: one
+training seed.
+
+### GPU utilisation: memory bound, not compute bound
+
+The model is far too small to saturate the L40S. Estimated from the shapes in
+`architecture.py` (worth confirming with `nsys`/`ncu`):
+
+| Datagen | MFLOP/pos | Compute | Traffic (fused) | Bandwidth |
+|---|---|---|---|---|
+| 6 blk, 95K nps | 327 | 17.2% of 181 TFLOPS | 3.56 MB/pos | 338 GB/s = 39% of 864 |
+| 10 blk, 59K nps | 545 | 17.8% | 5.93 MB/pos | 350 GB/s = 41% |
+
+Bandwidth barely moves between the two depths while compute stays ~17%, so the
+1.61× depth scaling above is not evidence of being compute bound. Arithmetic
+intensity 46–92 FLOP/byte against a ridge point of 209, set by `d_model`.
+
+So prediction is **depth costs full price, width is discounted**: `d_ff` 384 is +15% FLOPs
+and less in traffic, `d_ff` 512 +31%, against +67% for 6→10 blocks. 
+
+Will have more info as I gradually move to larger models.
+
+### Training throughput
+
+Batch 284 over 100 steps: 6 blocks ~2.0 s (14.2K pos/s), 10 blocks ~2.7 s
+(10.5K pos/s). 1.35× for 1.67× the FLOPs — overhead-bound rather than compute-bound.
 
 ## sz0_run3
 

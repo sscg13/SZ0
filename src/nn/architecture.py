@@ -63,7 +63,7 @@ class ShatranjBlock(nn.Module):
         return x
 
 class ShatranjNet(nn.Module):
-    num_layers: int = 6
+    num_layers: int = 10
     d_model: int = 256
     num_heads: int = 8
     d_ff: int = 256
