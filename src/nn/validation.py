@@ -51,24 +51,14 @@ def summarise(name, values):
     return f"{name}: {mean:.4f} +/- {1.96 * se:.4f} (sd {sd:.4f})"
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--run-dir", required=True,
-                    help="orbax checkpoint directory")
-    ap.add_argument("--step", type=int, default=None,
-                    help="checkpoint step to load (default: latest)")
-    ap.add_argument("--blocks", type=int, default=None,
-                    help="num_layers of the checkpoint (default: "
-                         "architecture.py's current default)")
-    ap.add_argument("--batches", type=int, default=1000,
-                    help="batches of 284 to average over (default 1000)")
-    ap.add_argument("--seed", type=int, default=0,
-                    help="batch-sampling seed; keep fixed across checkpoints")
-    ap.add_argument("--visit-temperature", type=float, default=1.0)
-    args = ap.parse_args()
-
-    model = (ShatranjNet() if args.blocks is None
-             else ShatranjNet(num_layers=args.blocks))
+def load_net(run_dir, blocks, step, d_ff=None):
+    """Restore a checkpoint into a TrainState. Returns (state, label)."""
+    overrides = {}
+    if blocks is not None:
+        overrides["num_layers"] = blocks
+    if d_ff is not None:
+        overrides["d_ff"] = d_ff
+    model = ShatranjNet(**overrides)
     variables = model.init(
         jax.random.PRNGKey(42),
         jnp.zeros((1, 64), dtype=jnp.int32),
@@ -85,18 +75,63 @@ def main():
     nparams = sum(x.size for x in jax.tree_util.tree_leaves(state.params))
 
     manager = ocp.CheckpointManager(
-        os.path.abspath(args.run_dir),
+        os.path.abspath(run_dir),
         options=ocp.CheckpointManagerOptions(create=False),
         item_names=("state",),
     )
-    step = args.step if args.step is not None else manager.latest_step()
+    step = step if step is not None else manager.latest_step()
     if step is None:
-        raise SystemExit(f"no checkpoints found in {args.run_dir}")
+        raise SystemExit(f"no checkpoints found in {run_dir}")
     state = manager.restore(
         step, args=ocp.args.Composite(state=ocp.args.StandardRestore(state))
     )["state"]
-    print(f"{args.run_dir} step {step} | {model.num_layers} blocks | "
-          f"{nparams:,} params")
+    label = (f"{run_dir} step {step} | {model.num_layers} blocks, "
+             f"d_ff {model.d_ff} | {nparams:,} params")
+    return state, label
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--run-dir", required=True,
+                    help="orbax checkpoint directory")
+    ap.add_argument("--step", type=int, default=None,
+                    help="checkpoint step to load (default: latest)")
+    ap.add_argument("--blocks", type=int, default=None,
+                    help="num_layers of the checkpoint (default: "
+                         "architecture.py's current default)")
+    ap.add_argument("--d-ff", type=int, default=None,
+                    help="d_ff of the checkpoint (default: architecture.py's "
+                         "current default)")
+    ap.add_argument("--vs", default=None, metavar="RUN_DIR",
+                    help="second checkpoint; reports the PAIRED per-batch "
+                         "delta (this minus --vs), which cancels batch "
+                         "difficulty and is far tighter than comparing two "
+                         "separate runs' means")
+    ap.add_argument("--vs-step", type=int, default=None)
+    ap.add_argument("--vs-blocks", type=int, default=None)
+    ap.add_argument("--vs-d-ff", type=int, default=None)
+    ap.add_argument("--batches", type=int, default=1000,
+                    help="batches of 284 to average over (default 1000)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="batch-sampling seed; keep fixed across checkpoints")
+    ap.add_argument("--visit-temperature", type=float, default=1.0)
+    args = ap.parse_args()
+
+    state_a, label_a = load_net(args.run_dir, args.blocks, args.step,
+                                args.d_ff)
+    print(label_a)
+    eval_a = jax.jit(
+        lambda params, batch: compute_loss(params, state_a.apply_fn, batch)
+    )
+
+    state_b = eval_b = None
+    if args.vs is not None:
+        state_b, label_b = load_net(args.vs, args.vs_blocks, args.vs_step,
+                                    args.vs_d_ff)
+        print(f"  vs  {label_b}")
+        eval_b = jax.jit(
+            lambda params, batch: compute_loss(params, state_b.apply_fn, batch)
+        )
 
     dataset = load_sparse_dataset(glob.glob("*.data"))
     loader = SparseInMemoryDataLoader(
@@ -104,28 +139,35 @@ def main():
         visit_temperature=args.visit_temperature,
     )
 
-    eval_loss = jax.jit(
-        lambda params, batch: compute_loss(params, state.apply_fn, batch)
-    )
+    names = ("Total ", "Policy", "Value ", "WDL   ", "Q     ")
+    series_a = [[] for _ in names]
+    deltas = [[] for _ in names]
 
-    # Seed numpy so get_batches' permutation is identical across checkpoints.
+    # Seed numpy so get_batches' permutation is identical across invocations.
     np.random.seed(args.seed)
-    totals, pols, vals, wdls, qs = [], [], [], [], []
     for i, batch in enumerate(loader.get_batches()):
         if i >= args.batches:
             break
-        total, (pol, val, wdl, q) = eval_loss(state.params, batch)
-        totals.append(float(total))
-        pols.append(float(pol))
-        vals.append(float(val))
-        wdls.append(float(wdl))
-        qs.append(float(q))
+        total, rest = eval_a(state_a.params, batch)
+        va = (float(total),) + tuple(float(x) for x in rest)
+        for series, v in zip(series_a, va):
+            series.append(v)
+        if eval_b is not None:
+            total_b, rest_b = eval_b(state_b.params, batch)
+            vb = (float(total_b),) + tuple(float(x) for x in rest_b)
+            for series, a, b in zip(deltas, va, vb):
+                series.append(a - b)
 
-    print(f"averaged over {len(totals)} batches "
-          f"({len(totals) * 284:,} positions), seed {args.seed}")
-    for name, series in (("Total ", totals), ("Policy", pols),
-                         ("Value ", vals), ("WDL   ", wdls), ("Q     ", qs)):
+    n = len(series_a[0])
+    print(f"averaged over {n} batches ({n * 284:,} positions), "
+          f"seed {args.seed}")
+    for name, series in zip(names, series_a):
         print("  " + summarise(name, series))
+
+    if eval_b is not None:
+        print("\npaired delta (this minus --vs; negative = this is better):")
+        for name, series in zip(names, deltas):
+            print("  " + summarise(name, series))
 
 
 if __name__ == "__main__":

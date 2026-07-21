@@ -143,6 +143,7 @@ train.
 Open follow-ups:
 
 - increase data window and/or train longer (confounded — see below)
+- reserve a small slice of datagen for representative validation
 - `d_ff` 256 → 384 (Leela's 1.5× ratio) or 512 (2×)
 - widen `d_model` — raise arithmetic intensity
 - more optimizations (fusing? Cuda graph?)
@@ -152,12 +153,15 @@ Open follow-ups:
 100 games, paired openings, fresh 6-block vs `run3_epoch28`:
 **−66.8 ± 36.4** pentanomial (−66.8 ± 49.2 trinomial), LOS 0.01%.
 
-Likely insufficient data — loss saturates ~4 epochs in, slightly above
-run3_epoch28's. But the gap is confounded between cumulative steps (8.4M vs
-1.8M) and cumulative unique positions (epoch28 saw a shifting window). Working
-estimate ~150-200M positions to match; untested.
+Likely insufficient data — loss seems to saturate. 
+See below, but validation indicates probably no major overfitting
+Need more testing later, probably ~150-200M positions to match.
 
-This gap is a major reason why comparisons are among fresh nets only.
+| Net | Current window | Old slice |
+|---|---|---|
+| baseline (6 blk) | 2.3993 | 2.2066 |
+| 10 blocks | 2.3789 | 2.1951 |
+| run3_epoch28 | 2.3236 | 2.1269 |
 
 ### 6 → 10 transformer blocks — adopted
 
