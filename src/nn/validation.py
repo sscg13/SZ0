@@ -51,13 +51,15 @@ def summarise(name, values):
     return f"{name}: {mean:.4f} +/- {1.96 * se:.4f} (sd {sd:.4f})"
 
 
-def load_net(run_dir, blocks, step, d_ff=None):
+def load_net(run_dir, blocks, step, d_ff=None, d_qk_head=None):
     """Restore a checkpoint into a TrainState. Returns (state, label)."""
     overrides = {}
     if blocks is not None:
         overrides["num_layers"] = blocks
     if d_ff is not None:
         overrides["d_ff"] = d_ff
+    if d_qk_head is not None:
+        overrides["d_qk_head"] = d_qk_head
     model = ShatranjNet(**overrides)
     variables = model.init(
         jax.random.PRNGKey(42),
@@ -85,8 +87,10 @@ def load_net(run_dir, blocks, step, d_ff=None):
     state = manager.restore(
         step, args=ocp.args.Composite(state=ocp.args.StandardRestore(state))
     )["state"]
+    qk = model.d_qk_head if model.d_qk_head is not None else (
+        model.d_model // model.num_heads)
     label = (f"{run_dir} step {step} | {model.num_layers} blocks, "
-             f"d_ff {model.d_ff} | {nparams:,} params")
+             f"d_ff {model.d_ff}, d_qk_head {qk} | {nparams:,} params")
     return state, label
 
 
@@ -102,6 +106,9 @@ def main():
     ap.add_argument("--d-ff", type=int, default=None,
                     help="d_ff of the checkpoint (default: architecture.py's "
                          "current default)")
+    ap.add_argument("--d-qk-head", type=int, default=None,
+                    help="QK head dim of the checkpoint (default: "
+                         "architecture.py's current default)")
     ap.add_argument("--vs", default=None, metavar="RUN_DIR",
                     help="second checkpoint; reports the PAIRED per-batch "
                          "delta (this minus --vs), which cancels batch "
@@ -110,6 +117,7 @@ def main():
     ap.add_argument("--vs-step", type=int, default=None)
     ap.add_argument("--vs-blocks", type=int, default=None)
     ap.add_argument("--vs-d-ff", type=int, default=None)
+    ap.add_argument("--vs-d-qk-head", type=int, default=None)
     ap.add_argument("--batches", type=int, default=1000,
                     help="batches of 284 to average over (default 1000)")
     ap.add_argument("--seed", type=int, default=0,
@@ -118,7 +126,7 @@ def main():
     args = ap.parse_args()
 
     state_a, label_a = load_net(args.run_dir, args.blocks, args.step,
-                                args.d_ff)
+                                args.d_ff, args.d_qk_head)
     print(label_a)
     eval_a = jax.jit(
         lambda params, batch: compute_loss(params, state_a.apply_fn, batch)
@@ -127,7 +135,7 @@ def main():
     state_b = eval_b = None
     if args.vs is not None:
         state_b, label_b = load_net(args.vs, args.vs_blocks, args.vs_step,
-                                    args.vs_d_ff)
+                                    args.vs_d_ff, args.vs_d_qk_head)
         print(f"  vs  {label_b}")
         eval_b = jax.jit(
             lambda params, batch: compute_loss(params, state_b.apply_fn, batch)

@@ -7,19 +7,24 @@ import flax.linen as nn
 class Attention(nn.Module):
     d_model: int = 256
     num_heads: int = 8
+    # QK head dim, decoupled from V. None => d_model // num_heads (unchanged).
+    # Set below that (e.g. half) to trim the low-rank attention scores.
+    d_qk_head: int = None
 
     @nn.compact
     def __call__(self, x):
         b, seq_len, _ = x.shape
-        head_dim = self.d_model // self.num_heads
+        v_head = self.d_model // self.num_heads
+        qk_head = self.d_qk_head if self.d_qk_head is not None else v_head
+        d_qk = self.num_heads * qk_head
 
         attn_input = nn.LayerNorm()(x)
 
-        q = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
-        k = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 3, 1))
-        v = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, head_dim)).transpose((0, 2, 1, 3))
+        q = nn.Dense(d_qk)(attn_input).reshape((b, seq_len, self.num_heads, qk_head)).transpose((0, 2, 1, 3))
+        k = nn.Dense(d_qk)(attn_input).reshape((b, seq_len, self.num_heads, qk_head)).transpose((0, 2, 3, 1))
+        v = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, v_head)).transpose((0, 2, 1, 3))
 
-        logits = jnp.matmul(q, k) / jnp.sqrt(head_dim)
+        logits = jnp.matmul(q, k) / jnp.sqrt(qk_head)
 
         # Broadcastable Spatial Bias: (1, num_heads, seq_len, seq_len)
         spatial_bias = self.param(
@@ -40,7 +45,7 @@ class Attention(nn.Module):
 
 class FeedForward(nn.Module):
     d_model: int = 256
-    d_ff: int = 256
+    d_ff: int = 512
 
     @nn.compact
     def __call__(self, x):
@@ -54,11 +59,12 @@ class FeedForward(nn.Module):
 class ShatranjBlock(nn.Module):
     d_model: int = 256
     num_heads: int = 8
-    d_ff: int = 256
+    d_ff: int = 512
+    d_qk_head: int = None
 
     @nn.compact
     def __call__(self, x):
-        x = Attention(self.d_model, self.num_heads)(x)
+        x = Attention(self.d_model, self.num_heads, self.d_qk_head)(x)
         x = FeedForward(self.d_model, self.d_ff)(x)
         return x
 
@@ -66,7 +72,8 @@ class ShatranjNet(nn.Module):
     num_layers: int = 10
     d_model: int = 256
     num_heads: int = 8
-    d_ff: int = 256
+    d_ff: int = 512
+    d_qk_head: int = None
     vocab_size: int = 13 * 64
     max_halfmoves: int = 140
 
@@ -84,7 +91,7 @@ class ShatranjNet(nn.Module):
 
         # Transformer Body
         for _ in range(self.num_layers):
-            x = ShatranjBlock(self.d_model, self.num_heads, self.d_ff)(x)
+            x = ShatranjBlock(self.d_model, self.num_heads, self.d_ff, self.d_qk_head)(x)
             
         x = nn.LayerNorm()(x)
 

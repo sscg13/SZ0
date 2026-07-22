@@ -144,14 +144,14 @@ Open follow-ups:
 
 - increase data window and/or train longer (confounded — see below)
 - reserve a small slice of datagen for representative validation
-- `d_ff` 256 → 384 (Leela's 1.5× ratio) or 512 (2×)
-- widen `d_model` — raise arithmetic intensity
+- try MoE, but not optimistic since Leela didn't have success
+- widen `d_model` — raises intensity but also traffic, so not free like `d_ff`
 - more optimizations (fusing? Cuda graph?)
 
 ### The baseline anchor is ~67 Elo below the iterative net
 
 100 games, paired openings, fresh 6-block vs `run3_epoch28`:
-**−66.8 ± 36.4** pentanomial (−66.8 ± 49.2 trinomial), LOS 0.01%.
+−66.8 ± 36.4 pentanomial, LOS 0.01%.
 
 Likely insufficient data — loss seems to saturate. 
 See below, but validation indicates probably no major overfitting
@@ -170,7 +170,7 @@ Need more testing later, probably ~150-200M positions to match.
 | Test | Score | Trinomial | Pentanomial | LOS |
 |---|---|---|---|---|
 | 6 sec + 0.1 sec | 0.5275 | +19.1 ± 31.2 | +19.1 ± 25.7 | 92.9% |
-| 5000 nodes/move | 0.5475 | +33.1 ± 34.4 | **+33.1 ± 24.8** | 99.6% |
+| 5000 nodes/move | 0.5475 | +33.1 ± 34.4 | +33.1 ± 24.8 | 99.6% |
 
 Fixed node isolates evaluation quality, TC nets it against the speed loss; the
 ~14 Elo gap is the cost of 25% fewer nodes.
@@ -184,6 +184,17 @@ Adopted despite TC falling short of significance: datagen is fixed-node, so the
 relevant figure is +33 against 38% fewer positions per hour. Caveats: one
 training seed.
 
+### d_ff 256 → 512 — adopted
+
+Both nets 10-block, single variable. Paired loss on the current train set
+(`validation.py --vs`): −0.0065 ± 0.0016, mostly the value head's Q
+term. ~10 Elo by the 10-vs-6-block calibration (0.0204 ↔ +33 fixed node),
+consistent with the TC match (+12.2 ± 17.7, 400 games, LOS 91%, not
+significant on its own).
+
+Datagen nps essentially unchanged despite +31% FLOPs: on the memory-bound net `d_ff` is a nearly-free
+capacity axis. 
+
 ### GPU utilisation: memory bound, not compute bound
 
 The model is far too small to saturate the L40S. Estimated from the shapes in
@@ -196,9 +207,9 @@ The model is far too small to saturate the L40S. Estimated from the shapes in
 
 Bandwidth barely moves between the two depths while compute stays ~17%, so the
 1.61× depth scaling above is not evidence of being compute bound. Arithmetic
-intensity 46–92 FLOP/byte against a ridge point of 209, set by `d_model`.
+intensity 46–92 FLOP/byte against an equilibrium of 209.
 
-So prediction is **depth costs full price, width is discounted**: `d_ff` 384 is +15% FLOPs
+So prediction is depth costs full price, width is discounted: `d_ff` 384 is +15% FLOPs
 and less in traffic, `d_ff` 512 +31%, against +67% for 6→10 blocks. 
 
 Will have more info as I gradually move to larger models.
