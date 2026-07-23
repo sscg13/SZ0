@@ -118,6 +118,7 @@ Many of these results are confounded by the concurrent change of improved sampli
 Open follow-ups:
 
 - combine the new (Gumbel greedy) selection with search contempt
+- less nodes per datagen? most direct way to get faster datagen
 
 ## Search Contempt
 
@@ -142,10 +143,24 @@ train.
 
 Open follow-ups:
 
+- figure out how to close the ~67 Elo data/iterative gap (below) — 10× the
+  noise floor, unlike any architecture tweak so far, will likely need to wait for
+  run4 to make more headway on this
 - increase data window and/or train longer (confounded — see below)
 - reserve a small slice of datagen for representative validation
-- try MoE, but not optimistic since Leela didn't have success
-- widen `d_model` — raises intensity but also traffic, so not free like `d_ff`
+- `qk 16` isolated datagen test (vs `qk 32` at same `d_ff`) — the one clean
+  throughput question left; decide `qk` on nps, not loss (quality is sub-floor)
+- MoE: not optimistic (Leela failed; MoE adds params + traffic, the wrong
+  trade for a memory-bound, data-limited net). Head specialization IS proven —
+  NNUE output buckets are hard-routed head-MoE (hand-selected by piece count).
+  For a data-limited net prefer a hand-designed router over a learned gate.
+  Caveat: a deep trunk may already learn phase-conditioning implicitly, so less
+  headroom than shallow NNUE. 
+- per-layer `d_ff` schedule (wider in deeper layers) — fixed-budget reallocation
+  so ~neutral throughput, but the effect is sub-floor: needs multi-seed or a
+  large reallocation to detect
+- widen `d_model` — raises intensity but also traffic, 
+  will be pretty costly for datagen, unless nodes can decrease
 - more optimizations (fusing? Cuda graph?)
 
 ### The baseline anchor is ~67 Elo below the iterative net
@@ -184,16 +199,18 @@ Adopted despite TC falling short of significance: datagen is fixed-node, so the
 relevant figure is +33 against 38% fewer positions per hour. Caveats: one
 training seed.
 
-### d_ff 256 → 512 — adopted
+### Measurement floor: run-to-run variance ≈ 0.0065 nats ≈ ~10 Elo
 
-Both nets 10-block, single variable. Paired loss on the current train set
-(`validation.py --vs`): −0.0065 ± 0.0016, mostly the value head's Q
-term. ~10 Elo by the 10-vs-6-block calibration (0.0204 ↔ +33 fixed node),
-consistent with the TC match (+12.2 ± 17.7, 400 games, LOS 91%, not
-significant on its own).
+"d_ff 512" checkpoint was mislabeled and actually `d_ff 256`.
+Two architecturally identical 10-block nets (separate training runs, same step
+count) differ by 0.0065 (roughly 10 Elo) in total validation loss. Future runs
+will focus more on datagen throughput as the decider.
 
-Datagen nps essentially unchanged despite +31% FLOPs: on the memory-bound net `d_ff` is a nearly-free
-capacity axis. 
+The one real `d_ff 512` net (also `qk 16`, so confounded) scores +0.0063 vs a `d_ff 256` net,
+within the noise floor above, no quality signal. Datagen: `d_ff 512 + qk 16` runs 55K nps vs 59K
+for `d_ff 256 + qk 32`, ~7% slower despite qk 16 helping, so `d_ff 512` alone
+costs more than that. Default remains `d_ff 256`. 
+`d_qk_head` kept as a parameter (default = `d_model // num_heads`).
 
 ### GPU utilisation: memory bound, not compute bound
 
@@ -209,8 +226,10 @@ Bandwidth barely moves between the two depths while compute stays ~17%, so the
 1.61× depth scaling above is not evidence of being compute bound. Arithmetic
 intensity 46–92 FLOP/byte against an equilibrium of 209.
 
-So prediction is depth costs full price, width is discounted: `d_ff` 384 is +15% FLOPs
-and less in traffic, `d_ff` 512 +31%, against +67% for 6→10 blocks. 
+Depth costs close to full price (1.61× for +67% FLOPs). Width is *partially*
+discounted but **not** free: `d_ff` 256→512 (+31% FLOPs) measured ≥~7% slower
+datagen (see above; confounded with qk16 which helps, so likely ~10–15% alone)
+— well under the ~24% a compute-bound net would pay, but real.
 
 Will have more info as I gradually move to larger models.
 

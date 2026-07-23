@@ -45,7 +45,7 @@ class Attention(nn.Module):
 
 class FeedForward(nn.Module):
     d_model: int = 256
-    d_ff: int = 512
+    d_ff: int = 256
 
     @nn.compact
     def __call__(self, x):
@@ -59,7 +59,7 @@ class FeedForward(nn.Module):
 class ShatranjBlock(nn.Module):
     d_model: int = 256
     num_heads: int = 8
-    d_ff: int = 512
+    d_ff: int = 256
     d_qk_head: int = None
 
     @nn.compact
@@ -72,7 +72,7 @@ class ShatranjNet(nn.Module):
     num_layers: int = 10
     d_model: int = 256
     num_heads: int = 8
-    d_ff: int = 512
+    d_ff: int = 256
     d_qk_head: int = None
     vocab_size: int = 13 * 64
     max_halfmoves: int = 140
