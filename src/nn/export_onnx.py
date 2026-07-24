@@ -14,7 +14,7 @@ from architecture import ShatranjNet
 from make_dynamic_batch import make_dynamic
 
 
-def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batch_size, convert_fp16, dynamic=False):
+def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batch_size, convert_fp16, dynamic=True):
     print("1. Loading Orbax Checkpoint...")
     model = ShatranjNet()
     
@@ -65,8 +65,8 @@ def export_jax_to_onnx(checkpoint_base_dir, step_to_load, output_onnx_path, batc
     optimized = optimize_model(
         f"temp_{output_onnx_path}",
         model_type='bert', # generic transformer
-        num_heads=8,
-        hidden_size=256
+        num_heads=model.num_heads,
+        hidden_size=model.d_model
     )
     
     if (convert_fp16):
@@ -126,27 +126,16 @@ if __name__ == "__main__":
         latest_step = get_latest_step(input_base_dir)
         print(f"Detected latest step: {latest_step} in {dir_name}")
 
-        conversions = [
-            {"batch": 1, "name": f"{dir_name}_epoch{latest_step}_single.onnx", "fp16": False},
-            {"batch": 32, "name": f"{dir_name}_epoch{latest_step}_search.onnx", "fp16": True},
-            {"batch": 284, "name": f"{dir_name}_batched.onnx", "fp16": True},
-            # One dynamic-batch file replaces the per-size exports above once
-            # verified: the engine pins the "batch" dim to searchbatchsize /
-            # datagenbatchsize / 1 at load (see NNEvaluator fixed_batch).
-            {"batch": 1, "name": f"{dir_name}_epoch{latest_step}_dynamic.onnx", "fp16": True, "dynamic": True},
-        ]
-
-        for task in conversions:
-            print(f"--- Starting conversion: Batch Size {task['batch']} ---")
-            export_jax_to_onnx(
-                input_base_dir,
-                latest_step,
-                task["name"],
-                task["batch"],
-                task["fp16"],
-                dynamic=task.get("dynamic", False)
-            )
-            print(f"Successfully exported to {task['name']}")
+        # One dynamic-batch file serves every batch size: the engine pins the
+        # "batch" dim to searchbatchsize / datagenbatchsize / 1 at load (see
+        # NNEvaluator fixed_batch). Must be exported at batch 1 — see the
+        # make_dynamic note in export_jax_to_onnx.
+        name = f"{dir_name}_epoch{latest_step}.onnx"
+        export_jax_to_onnx(
+            input_base_dir, latest_step, name,
+            batch_size=1, convert_fp16=True
+        )
+        print(f"Successfully exported to {name}")
 
     except Exception as e:
         print(f"Error during conversion process: {e}")

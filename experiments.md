@@ -148,8 +148,8 @@ Open follow-ups:
   run4 to make more headway on this
 - increase data window and/or train longer (confounded — see below)
 - reserve a small slice of datagen for representative validation
-- `qk 16` isolated datagen test (vs `qk 32` at same `d_ff`) — the one clean
-  throughput question left; decide `qk` on nps, not loss (quality is sub-floor)
+- `qk 64` — QK is by far the most Elo-dense axis per unit throughput (below);
+  prefer 64 over 48 so the effect can clear the ±17 match resolution
 - MoE: not optimistic (Leela failed; MoE adds params + traffic, the wrong
   trade for a memory-bound, data-limited net). Head specialization IS proven —
   NNUE output buckets are hard-routed head-MoE (hand-selected by piece count).
@@ -211,6 +211,40 @@ within the noise floor above, no quality signal. Datagen: `d_ff 512 + qk 16` run
 for `d_ff 256 + qk 32`, ~7% slower despite qk 16 helping, so `d_ff 512` alone
 costs more than that. Default remains `d_ff 256`. 
 `d_qk_head` kept as a parameter (default = `d_model // num_heads`).
+
+### qk 32 → 16 — strongly negative, rejected
+
+EfficientViT-style halving of the QK head dim (V untouched). 400 games, paired
+openings, 6s+0.1, both vs the `d_ff 256 + qk 32` net:
+
+| Test net | Pentanomial | LOS | Pairs |
+|---|---|---|---|
+| `d_ff 256` + `qk 16` (single variable) | −37.5 ± 16.7 | ~0% | `[3, 63, 109, 24, 1]` |
+| `d_ff 512` + `qk 16` (confounded) | −5.2 ± 17.6 | 28% | `[1, 51, 103, 43, 2]` |
+
+The EfficientViT result does not transfer. Likely because the spatial bias
+already covers static geometry, leaving QK to carry *all* content-dependent
+piece-piece relations — the sharp distinctions that decide games.
+
+Loss predicted this. Paired validation on the single-variable pair gives
++0.0149 ± 0.0016 — 2.3× the noise floor, i.e. flagged as clearly bad before any
+games. Loss is a usable screen between identically-trained fresh nets.
+
+`d_ff 512` may partly compensate for lost QK capacity, but not enough it seems. 
+
+Datagen cost, now decomposable:
+
+| Config | nps | vs baseline |
+|---|---|---|
+| `d_ff256 + qk16` | 63K | +6.8% |
+| `d_ff256 + qk32` (baseline) | 59K | — |
+| `d_ff512 + qk16` | 55K | −6.8% |
+| `d_ff512 + qk32` (inferred) | ~52K | −12% |
+
+Fitting `T = c + b·d_qk_head`, QK is only ~13% of datagen time at qk32;
+extrapolating up gives qk48 ≈ 55.5K, qk64 ≈ 52K.
+
+QK appears far more throughput-efficient than depth, so it is the next thing to test
 
 ### GPU utilisation: memory bound, not compute bound
 

@@ -7,22 +7,26 @@ import flax.linen as nn
 class Attention(nn.Module):
     d_model: int = 256
     num_heads: int = 8
-    # QK head dim, decoupled from V. None => d_model // num_heads (unchanged).
-    # Set below that (e.g. half) to trim the low-rank attention scores.
+    # QK and V head dims, decoupled from each other and from d_model.
+    # None => d_model // num_heads (unchanged). Decoupling V matters when
+    # changing num_heads, which would otherwise silently rescale it.
     d_qk_head: int = None
+    d_v_head: int = None
 
     @nn.compact
     def __call__(self, x):
         b, seq_len, _ = x.shape
-        v_head = self.d_model // self.num_heads
-        qk_head = self.d_qk_head if self.d_qk_head is not None else v_head
+        default_head = self.d_model // self.num_heads
+        qk_head = self.d_qk_head if self.d_qk_head is not None else default_head
+        v_head = self.d_v_head if self.d_v_head is not None else default_head
         d_qk = self.num_heads * qk_head
+        d_v = self.num_heads * v_head
 
         attn_input = nn.LayerNorm()(x)
 
         q = nn.Dense(d_qk)(attn_input).reshape((b, seq_len, self.num_heads, qk_head)).transpose((0, 2, 1, 3))
         k = nn.Dense(d_qk)(attn_input).reshape((b, seq_len, self.num_heads, qk_head)).transpose((0, 2, 3, 1))
-        v = nn.Dense(self.d_model)(attn_input).reshape((b, seq_len, self.num_heads, v_head)).transpose((0, 2, 1, 3))
+        v = nn.Dense(d_v)(attn_input).reshape((b, seq_len, self.num_heads, v_head)).transpose((0, 2, 1, 3))
 
         logits = jnp.matmul(q, k) / jnp.sqrt(qk_head)
 
@@ -37,7 +41,7 @@ class Attention(nn.Module):
         attn_weights = nn.softmax(logits, axis=-1)
         attn_out = jnp.matmul(attn_weights, v)
 
-        attn_out = attn_out.transpose((0, 2, 1, 3)).reshape((b, seq_len, self.d_model))
+        attn_out = attn_out.transpose((0, 2, 1, 3)).reshape((b, seq_len, d_v))
         attn_out = nn.Dense(self.d_model)(attn_out)
 
         return x + attn_out
@@ -61,10 +65,11 @@ class ShatranjBlock(nn.Module):
     num_heads: int = 8
     d_ff: int = 256
     d_qk_head: int = None
+    d_v_head: int = None
 
     @nn.compact
     def __call__(self, x):
-        x = Attention(self.d_model, self.num_heads, self.d_qk_head)(x)
+        x = Attention(self.d_model, self.num_heads, self.d_qk_head, self.d_v_head)(x)
         x = FeedForward(self.d_model, self.d_ff)(x)
         return x
 
@@ -74,6 +79,7 @@ class ShatranjNet(nn.Module):
     num_heads: int = 8
     d_ff: int = 256
     d_qk_head: int = None
+    d_v_head: int = None
     vocab_size: int = 13 * 64
     max_halfmoves: int = 140
 
@@ -91,7 +97,8 @@ class ShatranjNet(nn.Module):
 
         # Transformer Body
         for _ in range(self.num_layers):
-            x = ShatranjBlock(self.d_model, self.num_heads, self.d_ff, self.d_qk_head)(x)
+            x = ShatranjBlock(self.d_model, self.num_heads, self.d_ff,
+                              self.d_qk_head, self.d_v_head)(x)
             
         x = nn.LayerNorm()(x)
 
