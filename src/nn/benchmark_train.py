@@ -47,16 +47,20 @@ from dataloader import SparseInMemoryDataLoader, load_sparse_dataset, prefetch
 from train import compute_loss
 
 
-def make_step(donate):
-    def step(state, batch):
-        grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
-        (loss, _aux), grads = grad_fn(state.params, state.apply_fn, batch)
-        return state.apply_gradients(grads=grads), loss
+def _step(state, batch):
+    grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
+    (loss, _aux), grads = grad_fn(state.params, state.apply_fn, batch)
+    return state.apply_gradients(grads=grads), loss
 
-    # donate_argnums lets XLA write the updated params and optimizer moments
-    # into the buffers they came from instead of allocating a fresh set each
-    # step. Safe because the caller always rebinds `state` to the result.
-    return jax.jit(step, donate_argnums=(0,) if donate else ())
+
+# Cached so the four configurations share two compilations instead of forcing
+# four. donate_argnums lets XLA write the updated params and optimizer moments
+# into the buffers they came from rather than allocating a fresh set each step;
+# the donated `state` is destroyed by the call, which is why every benchmark
+# below gets its own.
+@functools.lru_cache(maxsize=None)
+def make_step(donate):
+    return jax.jit(_step, donate_argnums=(0,) if donate else ())
 
 
 def parse_d_ff(text):
@@ -94,42 +98,49 @@ def build_state(args):
     return state, model, n_params
 
 
-def bench_dataloader(loader, steps):
-    """Host cost alone: build batches and throw them away."""
+def bench_dataloader(loader, steps, warmup):
+    """Host cost alone: build batches and throw them away.
+
+    The warmup matters more here than anywhere else: the first `next()` pays for
+    a full permutation of the dataset (tens of millions of elements), and the
+    first batches also fault in pages of the sample arrays.
+    """
     it = loader.get_batches()
-    next(it)  # first batch pays for the epoch permutation
+    for _ in range(warmup):
+        next(it)
     t0 = time.perf_counter()
     n = 0
     for _ in it:
         n += 1
         if n >= steps:
             break
-    return time.perf_counter() - t0, n
+    return (time.perf_counter() - t0) / max(n, 1)
 
 
-def bench_compute(state, batch, steps, donate):
+def bench_compute(state, batch, steps, donate, warmup):
     """GPU cost alone: replay one device-resident batch, no host work."""
     step = make_step(donate)
     device_batch = jax.device_put(batch)
-    state, loss = step(state, device_batch)  # compile
+    for _ in range(warmup):
+        state, loss = step(state, device_batch)
     loss.block_until_ready()
 
     t0 = time.perf_counter()
     for _ in range(steps):
         state, loss = step(state, device_batch)
     loss.block_until_ready()
-    return time.perf_counter() - t0
+    return (time.perf_counter() - t0) / steps
 
 
-def bench_loop(state, loader, steps, donate, block_every, use_prefetch):
+def bench_loop(state, loader, steps, donate, block_every, use_prefetch, warmup):
     """The real thing: dataloader plus GPU, with or without the fixes."""
     step = make_step(donate)
     source = loader.get_batches()
     if use_prefetch:
         source = prefetch(source, depth=3)
 
-    first = next(source)
-    state, loss = step(state, first)  # compile
+    for _ in range(warmup):
+        state, loss = step(state, next(source))
     loss.block_until_ready()
 
     t0 = time.perf_counter()
@@ -142,12 +153,16 @@ def bench_loop(state, loader, steps, donate, block_every, use_prefetch):
         if n >= steps:
             break
     loss.block_until_ready()
-    return time.perf_counter() - t0, n
+    return (time.perf_counter() - t0) / max(n, 1)
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--steps", type=int, default=100)
+    ap.add_argument("--warmup", type=int, default=10,
+                    help="steps discarded before timing each configuration; "
+                         "covers JIT compilation, the dataset permutation, and "
+                         "first-touch page faults (default 10)")
     ap.add_argument("--batch-size", type=int, default=284)
     ap.add_argument("--blocks", type=int, default=None)
     ap.add_argument("--d-ff", type=str, default=None,
@@ -162,7 +177,8 @@ def main():
         raise SystemExit(f"no data files matched {args.data_glob!r}")
     print(f"Data files: {len(files)}")
 
-    state, _model, n_params = build_state(args)
+    _probe, _model, n_params = build_state(args)
+    del _probe
     print(f"Parameters: {n_params:,}")
     print(f"Device: {jax.devices()[0]}")
 
@@ -175,33 +191,43 @@ def main():
             visit_temperature=args.visit_temperature,
         )
 
-    steps = args.steps
-    positions = steps * args.batch_size
+    # A donated state is destroyed by the call that consumes it, so every
+    # configuration needs its own. The PRNG key is fixed, so all four start from
+    # identical weights.
+    def fresh_state():
+        return build_state(args)[0]
+
+    steps, warmup = args.steps, args.warmup
+    per_step_positions = args.batch_size
     results = {}
 
-    print(f"\nTiming {steps} steps x batch {args.batch_size} "
-          f"= {positions:,} positions per configuration...\n")
+    print(f"\n{steps} timed steps x batch {args.batch_size} per configuration "
+          f"({warmup} warmup steps discarded)...\n")
 
-    t, n = bench_dataloader(new_loader(), steps)
-    results["dataloader (host only)"] = t * steps / max(n, 1)
+    results["dataloader (host only)"] = bench_dataloader(
+        new_loader(), steps, warmup)
 
     sample = next(new_loader().get_batches())
-    results["compute (cached batch)"] = bench_compute(state, sample, steps, donate=False)
-    results["compute + donate"] = bench_compute(state, sample, steps, donate=True)
+    results["compute (cached batch)"] = bench_compute(
+        fresh_state(), sample, steps, donate=False, warmup=warmup)
+    results["compute + donate"] = bench_compute(
+        fresh_state(), sample, steps, donate=True, warmup=warmup)
 
-    t, n = bench_loop(state, new_loader(), steps, donate=False,
-                      block_every=1, use_prefetch=False)
-    results["current (sync every step)"] = t * steps / max(n, 1)
+    results["current (sync every step)"] = bench_loop(
+        fresh_state(), new_loader(), steps, donate=False,
+        block_every=1, use_prefetch=False, warmup=warmup)
 
-    t, n = bench_loop(state, new_loader(), steps, donate=True,
-                      block_every=100, use_prefetch=True)
-    results["pipelined (donate+prefetch)"] = t * steps / max(n, 1)
+    results["pipelined (donate+prefetch)"] = bench_loop(
+        fresh_state(), new_loader(), steps, donate=True,
+        block_every=100, use_prefetch=True, warmup=warmup)
 
     width = max(len(k) for k in results)
-    print(f"{'configuration':<{width}}   {'sec':>7}  {'pos/s':>9}")
-    print("-" * (width + 21))
+    print(f"{'configuration':<{width}}   {'ms/step':>8}  {'pos/s':>9}  "
+          f"{'sec/100':>8}")
+    print("-" * (width + 32))
     for name, secs in results.items():
-        print(f"{name:<{width}}   {secs:7.2f}  {positions / secs:9,.0f}")
+        print(f"{name:<{width}}   {1000 * secs:8.1f}  "
+              f"{per_step_positions / secs:9,.0f}  {100 * secs:8.2f}")
 
     compute = results["compute + donate"]
     current = results["current (sync every step)"]
@@ -209,12 +235,13 @@ def main():
     host = results["dataloader (host only)"]
 
     print()
-    print(f"Host work is {100 * host / current:.0f}% of the current step time, "
-          f"and {'fully' if host < compute else 'NOT'} hideable behind "
-          f"{compute:.2f}s of compute.")
-    print(f"Pipelining recovers {current - pipelined:+.2f}s "
+    print(f"Host work is {100 * host / current:.0f}% of the current step, and "
+          f"{'fully' if host < compute else 'NOT'} hideable behind "
+          f"{1000 * compute:.1f} ms of compute.")
+    print(f"Pipelining: {1000 * current:.1f} -> {1000 * pipelined:.1f} ms/step "
           f"({100 * (current / pipelined - 1):+.0f}% throughput); "
-          f"{pipelined - compute:.2f}s still sits above the compute floor.")
+          f"{1000 * (pipelined - compute):.1f} ms still above the compute "
+          f"floor.")
     if pipelined <= compute * 1.05:
         print("=> At the compute floor. Further gains need the model or the "
               "optimizer, not the input pipeline.")
