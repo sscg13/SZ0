@@ -251,6 +251,14 @@ void uci() {
       }
     }
   }
+
+  // Release the ONNX session while the CUDA driver is still up. `nn` is a
+  // namespace-scope global, so left alone it is destroyed during static
+  // teardown — by which point CUDA's own atexit handler has started shutting
+  // the driver down, and ORT's cudaStreamDestroy / cudaGraphExecDestroy fail
+  // with "driver shutting down". Those throw from a destructor, so the
+  // process aborts instead of exiting. Covers both `quit` and stdin EOF.
+  nn.reset();
 }
 
 int main(int argc, char *argv[]) {
