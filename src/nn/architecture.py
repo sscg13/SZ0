@@ -1,3 +1,4 @@
+import functools
 import math
 from typing import Sequence, Union
 
@@ -53,6 +54,10 @@ class Attention(nn.Module):
     # changing num_heads, which would otherwise silently rescale it.
     d_qk_head: int = 64
     d_v_head: int = None
+    # Compute dtype. Weights always stay float32 (see param_dtype below), so
+    # bfloat16 here is mixed precision with fp32 master weights, not bf16
+    # training. Softmax is forced back to fp32 regardless.
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x):
@@ -62,12 +67,15 @@ class Attention(nn.Module):
         v_head = self.d_v_head if self.d_v_head is not None else default_head
         d_qk = self.num_heads * qk_head
         d_v = self.num_heads * v_head
+        dense = functools.partial(nn.Dense, dtype=self.dtype,
+                                  param_dtype=jnp.float32)
 
-        attn_input = nn.LayerNorm()(x)
+        attn_input = nn.LayerNorm(dtype=self.dtype,
+                                  param_dtype=jnp.float32)(x)
 
-        q = nn.Dense(d_qk)(attn_input).reshape((b, seq_len, self.num_heads, qk_head)).transpose((0, 2, 1, 3))
-        k = nn.Dense(d_qk)(attn_input).reshape((b, seq_len, self.num_heads, qk_head)).transpose((0, 2, 3, 1))
-        v = nn.Dense(d_v)(attn_input).reshape((b, seq_len, self.num_heads, v_head)).transpose((0, 2, 1, 3))
+        q = dense(d_qk)(attn_input).reshape((b, seq_len, self.num_heads, qk_head)).transpose((0, 2, 1, 3))
+        k = dense(d_qk)(attn_input).reshape((b, seq_len, self.num_heads, qk_head)).transpose((0, 2, 3, 1))
+        v = dense(d_v)(attn_input).reshape((b, seq_len, self.num_heads, v_head)).transpose((0, 2, 1, 3))
 
         logits = jnp.matmul(q, k) / jnp.sqrt(qk_head)
 
@@ -77,13 +85,17 @@ class Attention(nn.Module):
             nn.initializers.normal(stddev=0.02),
             (1, self.num_heads, seq_len, seq_len)
         )
-        logits = logits + spatial_bias
+        logits = logits + spatial_bias.astype(logits.dtype)
 
-        attn_weights = nn.softmax(logits, axis=-1)
+        # Softmax in fp32 even in mixed precision: the exponentials and the
+        # reduction are where low precision actually costs accuracy, and this
+        # tensor is small relative to the matmuls it sits between.
+        attn_weights = nn.softmax(logits.astype(jnp.float32),
+                                  axis=-1).astype(self.dtype)
         attn_out = jnp.matmul(attn_weights, v)
 
         attn_out = attn_out.transpose((0, 2, 1, 3)).reshape((b, seq_len, d_v))
-        attn_out = nn.Dense(self.d_model)(attn_out)
+        attn_out = dense(self.d_model)(attn_out)
 
         return x + attn_out
 
@@ -91,13 +103,16 @@ class Attention(nn.Module):
 class FeedForward(nn.Module):
     d_model: int = 256
     d_ff: int = 256
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x):
-        ff_input = nn.LayerNorm()(x)
-        ff_out = nn.Dense(self.d_ff)(ff_input)
+        dense = functools.partial(nn.Dense, dtype=self.dtype,
+                                  param_dtype=jnp.float32)
+        ff_input = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(x)
+        ff_out = dense(self.d_ff)(ff_input)
         ff_out = nn.silu(ff_out)
-        ff_out = nn.Dense(self.d_model)(ff_out)
+        ff_out = dense(self.d_model)(ff_out)
         return x + ff_out
 
 
@@ -107,11 +122,13 @@ class ShatranjBlock(nn.Module):
     d_ff: int = 256
     d_qk_head: int = 64
     d_v_head: int = None
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x):
-        x = Attention(self.d_model, self.num_heads, self.d_qk_head, self.d_v_head)(x)
-        x = FeedForward(self.d_model, self.d_ff)(x)
+        x = Attention(self.d_model, self.num_heads, self.d_qk_head,
+                      self.d_v_head, self.dtype)(x)
+        x = FeedForward(self.d_model, self.d_ff, self.dtype)(x)
         return x
 
 class ShatranjNet(nn.Module):
@@ -123,6 +140,12 @@ class ShatranjNet(nn.Module):
     d_ff: Union[int, Sequence[int]] = 256
     d_qk_head: int = 64
     d_v_head: int = None
+    # jnp.bfloat16 runs the trunk in mixed precision: weights stay float32, only
+    # activations and matmul inputs narrow. The model is bandwidth-bound (the
+    # dominant GEMM sits at ~63 FLOP/byte against an L40S ridge point near 209),
+    # so halving activation traffic is the main lever left on training speed.
+    # Outputs are always returned as float32 so the loss is unaffected.
+    dtype: jnp.dtype = jnp.float32
     vocab_size: int = 13 * 64
     max_halfmoves: int = 140
 
@@ -137,11 +160,16 @@ class ShatranjNet(nn.Module):
         safe_board_tokens = board_tokens
         safe_halfmove_token = halfmove_token
 
-        # Embeddings & Setup (using the safe tokens)
-        x = nn.Embed(num_embeddings=self.vocab_size, features=self.d_model)(safe_board_tokens)
+        embed = functools.partial(nn.Embed, dtype=self.dtype,
+                                  param_dtype=jnp.float32)
+        dense = functools.partial(nn.Dense, dtype=self.dtype,
+                                  param_dtype=jnp.float32)
 
-        g_emb = nn.Embed(num_embeddings=self.max_halfmoves, features=self.d_model)(safe_halfmove_token) 
-        x = x + jnp.expand_dims(g_emb, axis=-2) 
+        # Embeddings & Setup (using the safe tokens)
+        x = embed(num_embeddings=self.vocab_size, features=self.d_model)(safe_board_tokens)
+
+        g_emb = embed(num_embeddings=self.max_halfmoves, features=self.d_model)(safe_halfmove_token)
+        x = x + jnp.expand_dims(g_emb, axis=-2)
 
         # Transformer Body
         widths = ((self.d_ff,) * self.num_layers
@@ -151,25 +179,27 @@ class ShatranjNet(nn.Module):
                              f"num_layers is {self.num_layers}")
         for width in widths:
             x = ShatranjBlock(self.d_model, self.num_heads, width,
-                              self.d_qk_head, self.d_v_head)(x)
-            
-        x = nn.LayerNorm()(x)
+                              self.d_qk_head, self.d_v_head, self.dtype)(x)
+
+        x = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(x)
 
         # Value Head
-        v = nn.Dense(16)(x)
-        v = nn.relu(v) 
-        v = v.reshape((v.shape[0], -1)) 
-        v = nn.Dense(32)(v)
+        v = dense(16)(x)
         v = nn.relu(v)
-        value_logits = nn.Dense(3)(v)
+        v = v.reshape((v.shape[0], -1))
+        v = dense(32)(v)
+        v = nn.relu(v)
+        value_logits = dense(3)(v)
 
         # Policy Head (Dot-Product)
-        p_from = nn.Dense(64)(x) 
-        p_to = nn.Dense(64)(x)   
+        p_from = dense(64)(x)
+        p_to = dense(64)(x)
         p_to_transposed = jnp.swapaxes(p_to, -1, -2)
         policy_logits = jnp.matmul(p_from, p_to_transposed) / 8.0
 
-        return policy_logits, value_logits
+        # Always hand fp32 to the loss / exporter, whatever the trunk ran in.
+        return (policy_logits.astype(jnp.float32),
+                value_logits.astype(jnp.float32))
 
 
 # --- 2. The Testing Script ---

@@ -80,6 +80,8 @@ def build_state(args):
         model_kwargs["d_ff"] = d_ff
     if args.d_qk_head is not None:
         model_kwargs["d_qk_head"] = args.d_qk_head
+    model_kwargs["dtype"] = {"f32": jnp.float32,
+                             "bf16": jnp.bfloat16}[args.dtype]
 
     model = ShatranjNet(**model_kwargs)
     optimizer = optax.chain(
@@ -168,6 +170,9 @@ def main():
     ap.add_argument("--d-ff", type=str, default=None,
                     help="int, or comma-separated per-layer widths")
     ap.add_argument("--d-qk-head", type=int, default=None)
+    ap.add_argument("--dtype", choices=("f32", "bf16"), default="f32",
+                    help="trunk compute dtype; weights stay f32 either way "
+                         "(default f32, i.e. current behaviour)")
     ap.add_argument("--visit-temperature", type=float, default=1.0)
     ap.add_argument("--data-glob", type=str, default="*.data")
     args = ap.parse_args()
@@ -217,8 +222,16 @@ def main():
         fresh_state(), new_loader(), steps, donate=False,
         block_every=1, use_prefetch=False, warmup=warmup)
 
-    results["pipelined (donate+prefetch)"] = bench_loop(
-        fresh_state(), new_loader(), steps, donate=True,
+    # Isolates the sync from the thread. JAX dispatches asynchronously, so
+    # dropping the per-step block may already let the host build the next batch
+    # while the GPU runs the current one — in which case the prefetch thread is
+    # redundant and should not be carried.
+    results["no per-step sync only"] = bench_loop(
+        fresh_state(), new_loader(), steps, donate=False,
+        block_every=100, use_prefetch=False, warmup=warmup)
+
+    results["+ prefetch thread"] = bench_loop(
+        fresh_state(), new_loader(), steps, donate=False,
         block_every=100, use_prefetch=True, warmup=warmup)
 
     width = max(len(k) for k in results)
@@ -229,9 +242,10 @@ def main():
         print(f"{name:<{width}}   {1000 * secs:8.1f}  "
               f"{per_step_positions / secs:9,.0f}  {100 * secs:8.2f}")
 
-    compute = results["compute + donate"]
+    compute = min(results["compute (cached batch)"], results["compute + donate"])
     current = results["current (sync every step)"]
-    pipelined = results["pipelined (donate+prefetch)"]
+    nosync = results["no per-step sync only"]
+    pipelined = min(nosync, results["+ prefetch thread"])
     host = results["dataloader (host only)"]
 
     print()
@@ -242,6 +256,15 @@ def main():
           f"({100 * (current / pipelined - 1):+.0f}% throughput); "
           f"{1000 * (pipelined - compute):.1f} ms still above the compute "
           f"floor.")
+    thread_gain = nosync - results["+ prefetch thread"]
+    if thread_gain < 0.02 * nosync:
+        print(f"The prefetch thread adds {1000 * thread_gain:+.1f} ms — inside "
+              f"noise. Async dispatch already overlaps the dataloader; drop the "
+              f"thread.")
+    else:
+        print(f"The prefetch thread is worth {1000 * thread_gain:.1f} ms/step "
+              f"beyond removing the sync; keep it.")
+
     if pipelined <= compute * 1.05:
         print("=> At the compute floor. Further gains need the model or the "
               "optimizer, not the input pipeline.")
