@@ -144,16 +144,41 @@ CPU-provider reading is actively misleading: fp16 Softmax has no CPU kernel, so
 CPU decomposes it into ReduceMax/Sub/Exp/ReduceSum/Div and inserts ~130 Casts,
 none of which happens on CUDA.
 
-Production graph (10 blk, qk64, batch 32, CUDA, ORT 1.24): **326 nodes, 59%
+Production graph (10 blk, qk64, batch 32, CUDA, ORT 1.24): **322 nodes, 60%
 data movement**. Already fused: `BiasSoftmax` ×10 (spatial bias + softmax),
 `FusedMatMul` ×11 (attention scale folded into the matmul),
 `SkipLayerNormalization` ×20, `QuickGelu` ×10. Offline rewrites for any of
 these are redundant — tried and reverted.
 
 Left on the table: whole-attention fusion never fires (no `MultiHeadAttention`,
-so the scores tensor still round-trips through HBM), 146 Reshape + 40 Transpose
-survive, and there are 326 kernel launches per inference with no CUDA graph
-capture (`enable_cuda_graph` is not set).
+so the scores tensor still round-trips through HBM), and 146 Reshape + 40
+Transpose survive.
+
+### CUDA graph capture — +10–15% search, adopted behind a flag
+
+`SZ0_CUDA_GRAPH=1` (requires a pinned batch). ORT records the ~320 kernel
+launches once and replays them as a single launch. Measured **+10–15% search
+nps**, ≈ +5 Elo at TC — below the noise floor, so adopt on the nps measurement,
+not on games.
+
+Two blockers had to be cleared first:
+
+- **`jnp.clip` in the model made capture impossible.** int32 `Clip` has no CUDA
+  kernel, so ORT put both guards on the CPU provider and inserted
+  `MemcpyFromHost`; capture requires *every* node on the CUDA EP. Removed from
+  `architecture.py`, halfmove clamped in C++ instead (`clamp_halfmove`). Only
+  findable via `SZ0_ORT_VERBOSE=1`, which logs node placement — the error
+  message itself names no op.
+- **Exit aborted** (`cudaGraphExecDestroy`: "driver shutting down"). The session
+  global outlived CUDA's atexit handler; `nn.reset()` at the end of `uci()`
+  fixes it. Pre-existing latent bug — `cudaStreamDestroy` was already failing on
+  every GPU exit, ORT just logged instead of throwing.
+
+Predicted 2.2× from a `c = 0.59 ms` fixed-cost fit; got 10–15%, so launch
+overhead is only ~0.1–0.15 ms of that. The rest is memcpy (the policy D2H alone
+is 32 × 4096 × 4 B = 524 KB), ORT per-`Run` bookkeeping, and worker tree work
+that fails to overlap. **Next lever is the memcpy traffic, not the launches** —
+fp16 policy output would halve the D2H.
 
 ## sz0_run4
 
@@ -182,7 +207,7 @@ Open follow-ups:
   large reallocation to detect
 - widen `d_model` — raises intensity but also traffic, 
   will be pretty costly for datagen, unless nodes can decrease
-- more optimizations (fusing? Cuda graph?)
+- fp16 policy output to halve the D2H memcpy (see CUDA graph section)
 
 ### The baseline anchor is ~67 Elo below the iterative net
 
