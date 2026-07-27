@@ -84,10 +84,10 @@ NNOutput NNEvaluator::infer(const Position &pos) {
     std::copy(board_data, board_data + 64, pieces.begin());
     halfmoves[0] = halfmove_data[0];
     std::lock_guard<std::mutex> lock(graph_mutex_);
-    run_bound_locked(pieces, halfmoves, 1);
+    run_bound_locked(pieces, halfmoves, 1, 0);
     NNOutput result;
-    std::copy(h_policy_, h_policy_ + 4096, result.policy);
-    std::copy(h_value_, h_value_ + 3, result.value);
+    std::copy(h_policy_[0], h_policy_[0] + 4096, result.policy);
+    std::copy(h_value_[0], h_value_[0] + 3, result.value);
     return result;
   }
 #endif
@@ -130,14 +130,16 @@ bool NNEvaluator::setup_cuda_graph(int batch) {
     if (!d_board_ || !d_half_ || !d_policy_ || !d_value_)
       return false;
 
-    if (cudaHostAlloc(reinterpret_cast<void **>(&h_policy_),
-                      n * 4096 * sizeof(float), cudaHostAllocDefault) !=
-            cudaSuccess ||
-        cudaHostAlloc(reinterpret_cast<void **>(&h_value_),
-                      n * 3 * sizeof(float),
-                      cudaHostAllocDefault) != cudaSuccess) {
-      fprintf(stderr, "cudaHostAlloc failed for the D2H staging buffers\n");
-      return false;
+    for (int s = 0; s < kBatchSlots; ++s) {
+      if (cudaHostAlloc(reinterpret_cast<void **>(&h_policy_[s]),
+                        n * 4096 * sizeof(float), cudaHostAllocDefault) !=
+              cudaSuccess ||
+          cudaHostAlloc(reinterpret_cast<void **>(&h_value_[s]),
+                        n * 3 * sizeof(float),
+                        cudaHostAllocDefault) != cudaSuccess) {
+        fprintf(stderr, "cudaHostAlloc failed for the D2H staging buffers\n");
+        return false;
+      }
     }
 
     // Policy is [batch, 64, 64]; the engine treats it as 4096 flat per position.
@@ -231,7 +233,7 @@ IoTimer io_timer;
 
 void NNEvaluator::run_bound_locked(const std::vector<int32_t> &flat_pieces,
                                    const std::vector<int32_t> &flat_halfmoves,
-                                   int real_count) {
+                                   int real_count, int slot) {
   const size_t n = static_cast<size_t>(graph_batch_);
   const bool timing = io_timer.on;
   clk::time_point t{};
@@ -250,10 +252,10 @@ void NNEvaluator::run_bound_locked(const std::vector<int32_t> &flat_pieces,
   if (timing)
     io_timer.run += us_since(&t);
 
-  cudaMemcpy(h_policy_, d_policy_,
+  cudaMemcpy(h_policy_[slot], d_policy_,
              static_cast<size_t>(real_count) * 4096 * sizeof(float),
              cudaMemcpyDeviceToHost);
-  cudaMemcpy(h_value_, d_value_,
+  cudaMemcpy(h_value_[slot], d_value_,
              static_cast<size_t>(real_count) * 3 * sizeof(float),
              cudaMemcpyDeviceToHost);
   if (timing)
@@ -261,10 +263,12 @@ void NNEvaluator::run_bound_locked(const std::vector<int32_t> &flat_pieces,
 }
 
 NNEvaluator::~NNEvaluator() {
-  if (h_policy_)
-    cudaFreeHost(h_policy_);
-  if (h_value_)
-    cudaFreeHost(h_value_);
+  for (int s = 0; s < kBatchSlots; ++s) {
+    if (h_policy_[s])
+      cudaFreeHost(h_policy_[s]);
+    if (h_value_[s])
+      cudaFreeHost(h_value_[s]);
+  }
 }
 #endif
 
@@ -275,7 +279,7 @@ NNEvaluator::infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
 #ifdef USE_CUDA
   if (cuda_graph_ && batch_size == graph_batch_) {
     std::lock_guard<std::mutex> lock(graph_mutex_);
-    run_bound_locked(flat_pieces, flat_halfmoves, batch_size);
+    run_bound_locked(flat_pieces, flat_halfmoves, batch_size, 0);
     clk::time_point t{};
     if (io_timer.on)
       t = clk::now();
@@ -284,9 +288,10 @@ NNEvaluator::infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
     // call), where the marshalling is a much smaller share than at batch 284.
     std::vector<NNOutput> results(batch_size);
     for (int b = 0; b < batch_size; ++b) {
-      std::copy(h_policy_ + b * 4096, h_policy_ + (b + 1) * 4096,
+      std::copy(h_policy_[0] + b * 4096, h_policy_[0] + (b + 1) * 4096,
                 results[b].policy);
-      std::copy(h_value_ + b * 3, h_value_ + (b + 1) * 3, results[b].value);
+      std::copy(h_value_[0] + b * 3, h_value_[0] + (b + 1) * 3,
+                results[b].value);
     }
     if (io_timer.on) {
       io_timer.copy_out += us_since(&t);
@@ -327,13 +332,14 @@ NNEvaluator::infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
 }
 
 void NNEvaluator::infer_packed(const std::vector<int32_t> &flat_pieces,
-                               const std::vector<int32_t> &flat_halfmoves) {
+                               const std::vector<int32_t> &flat_halfmoves,
+                               int slot) {
 #ifdef USE_CUDA
   if (cuda_graph_ && graph_batch_ == datagenbatchsize) {
     std::lock_guard<std::mutex> lock(graph_mutex_);
-    run_bound_locked(flat_pieces, flat_halfmoves, datagenbatchsize);
-    last_policy_ = h_policy_;
-    last_value_ = h_value_;
+    run_bound_locked(flat_pieces, flat_halfmoves, datagenbatchsize, slot);
+    last_policy_[slot] = h_policy_[slot];
+    last_value_[slot] = h_value_[slot];
     if (io_timer.on)
       io_timer.tick(datagenbatchsize);
     return;
@@ -356,12 +362,13 @@ void NNEvaluator::infer_packed(const std::vector<int32_t> &flat_pieces,
   input_tensors.push_back(std::move(halfmove_tensor));
 
   // Held in a member rather than a local: the caller reads the rows straight
-  // out of these tensors, so they have to outlive the call.
-  last_outputs_ = session.Run(
+  // out of these tensors, so they have to outlive the call. Per slot, for the
+  // same reason the pinned buffers are.
+  last_outputs_[slot] = session.Run(
       Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(),
       input_tensors.size(), output_names.data(), output_names.size());
-  last_policy_ = last_outputs_[0].GetTensorData<float>();
-  last_value_ = last_outputs_[1].GetTensorData<float>();
+  last_policy_[slot] = last_outputs_[slot][0].GetTensorData<float>();
+  last_value_[slot] = last_outputs_[slot][1].GetTensorData<float>();
 }
 
 std::future<NNOutput> BatchEvaluator::submit(const Position &pos) {

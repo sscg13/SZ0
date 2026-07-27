@@ -47,6 +47,10 @@ inline int32_t clamp_halfmove(int halfmovecount) {
       std::clamp(halfmovecount, 0, max_halfmoves - 1));
 }
 
+// Independent result slots an evaluator can hold at once. Two is what datagen's
+// pipelined loop needs: the GPU fills slot p while workers still read slot 1-p.
+inline constexpr int kBatchSlots = 2;
+
 class NNEvaluator {
   Ort::Env env;
   Ort::Session session{nullptr};
@@ -84,34 +88,39 @@ class NNEvaluator {
   //  2. Pinned memory lets the driver DMA without staging through its own
   //     bounce buffer: pageable measured ~12.6 GB/s, pinned should roughly
   //     double it (~370 -> ~190 us).
-  float *h_policy_ = nullptr;
-  float *h_value_ = nullptr;
+  //
+  // One set per slot. Only the *host* side needs doubling: a single Run is in
+  // flight at a time, so the device buffers are reused, but datagen's pipelined
+  // loop has workers still reading slot 1-p while slot p is being filled.
+  float *h_policy_[kBatchSlots] = {nullptr, nullptr};
+  float *h_value_[kBatchSlots] = {nullptr, nullptr};
 
   // Returns false if anything about capture setup fails; caller then keeps
   // using the ordinary Run path.
   bool setup_cuda_graph(int batch);
 
-  // Uploads, runs the captured graph, and lands the outputs in h_policy_ /
-  // h_value_ (row b at h_policy_ + b*4096). Inputs must already be padded to
-  // graph_batch_; only the first real_count rows are copied back. The caller
-  // must hold graph_mutex_ for the call *and* for as long as it reads the
-  // buffers afterwards, since they are shared across calls.
+  // Uploads, runs the captured graph, and lands the outputs in
+  // h_policy_[slot] / h_value_[slot] (row b at h_policy_[slot] + b*4096).
+  // Inputs must already be padded to graph_batch_; only the first real_count
+  // rows are copied back. The caller must hold graph_mutex_ for the call; it
+  // may read the slot afterwards without the lock, provided no other inference
+  // targets that same slot in the meantime.
   void run_bound_locked(const std::vector<int32_t> &flat_pieces,
                         const std::vector<int32_t> &flat_halfmoves,
-                        int real_count);
+                        int real_count, int slot);
 #endif
 
   // According to ONNX
   std::vector<const char *> input_names = {"in_0", "in_1"};
   std::vector<const char *> output_names = {"policy", "value"};
 
-  // Where the last infer_packed left its results. With CUDA graph capture on
-  // these point at the pinned landing buffers; otherwise they point into
-  // last_outputs_, which is held precisely so ORT's device-to-host staging
-  // survives the call and needs no copy of our own.
-  const float *last_policy_ = nullptr;
-  const float *last_value_ = nullptr;
-  std::vector<Ort::Value> last_outputs_;
+  // Where the last infer_packed left each slot's results. With CUDA graph
+  // capture on these point at the pinned landing buffers; otherwise they point
+  // into last_outputs_, which is held precisely so ORT's device-to-host
+  // staging survives the call and needs no copy of our own.
+  const float *last_policy_[kBatchSlots] = {nullptr, nullptr};
+  const float *last_value_[kBatchSlots] = {nullptr, nullptr};
+  std::vector<Ort::Value> last_outputs_[kBatchSlots];
 
 public:
   // fixed_batch > 0 pins a symbolic batch dimension named "batch" (if the
@@ -240,23 +249,23 @@ public:
 #endif
 
   NNOutput infer(const Position &pos);
-  // Runs a full datagenbatchsize batch and leaves the results addressable via
-  // batch_policy() / batch_value(). Deliberately does NOT scatter them into
-  // per-game structs: that is ~280 independent row copies, and doing it here
-  // would run them on the single thread that owns inference while every worker
-  // waits at a barrier. Callers consume the rows from their own parallel phase
-  // instead.
+  // Runs a full datagenbatchsize batch into `slot` and leaves the results
+  // addressable via batch_policy(slot) / batch_value(slot). Deliberately does
+  // NOT scatter them into per-game structs: that is ~280 independent row
+  // copies, and doing it here would run them on the single thread that owns
+  // inference while every worker waits at a barrier. Callers consume the rows
+  // from their own parallel phase instead.
   void infer_packed(const std::vector<int32_t> &flat_pieces,
-                    const std::vector<int32_t> &flat_halfmoves);
+                    const std::vector<int32_t> &flat_halfmoves, int slot = 0);
 
-  // Row b of the last infer_packed batch: 4096 policy floats at
-  // batch_policy() + b*4096, 3 value floats at batch_value() + b*3.
+  // Row b of the batch last run into `slot`: 4096 policy floats at
+  // batch_policy(slot) + b*4096, 3 value floats at batch_value(slot) + b*3.
   //
-  // Valid only until the next inference call on this evaluator, which
-  // overwrites the buffers in place. Safe to read concurrently from many
-  // threads in between; not safe to overlap with another inference.
-  const float *batch_policy() const { return last_policy_; }
-  const float *batch_value() const { return last_value_; }
+  // Valid until the next inference targeting that same slot. Safe to read
+  // concurrently from many threads meanwhile, including while a Run targeting
+  // the *other* slot is in flight — that is the whole point of having two.
+  const float *batch_policy(int slot = 0) const { return last_policy_[slot]; }
+  const float *batch_value(int slot = 0) const { return last_value_[slot]; }
   std::vector<NNOutput>
   infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
                       const std::vector<int32_t> &flat_halfmoves,

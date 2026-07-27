@@ -305,11 +305,44 @@ children per expansion, with zero overflows. `datagenarenasize` cut to 32768
 children but still backprops, leaving a leaf that is re-selected forever — now
 counted and warned about rather than degrading quality invisibly.
 
-Priority order after all of the above: batch backfill (~20%, done) > double
-buffering (~10%, doubles pool memory — two game pools alternating so tree work
-hides under the next batch's GPU work) > anything left inside the ONNX graph
-(a few %). Overlapping the h2d/d2h copies needs async streams and a second
-capture: larger change, smallest prize of the three.
+### Pipelined datagen (two game pools)
+
+Inference was ~85% of the cycle with 7 of 8 workers parked at a barrier. It
+cannot be overlapped within one pool (select for rollout N+1 depends on expand
+of N), so there are now two pools: while the GPU evaluates pool p, the workers
+do tree work for pool 1-p. Inference moved to its own thread; the middle barrier
+became a per-pool submitted/completed handshake.
+
+Ceiling is the GPU phase alone: 284/3880 µs ≈ **73K nps from 62K (+17%)**.
+
+Correctness measures, since a race here would silently corrupt training data
+rather than crash:
+
+- Everything a batch touches is per-pool (games, packed inputs, both index
+  maps, the evaluator result slot). Only the output file and counters are
+  shared.
+- `NNEvaluator` has two pinned landing buffers. With one, a Run would overwrite
+  results still being read by workers. Device buffers stay single — only one
+  Run is ever in flight.
+- Workers compare `completed` against a per-worker consumed count rather than
+  trusting a wakeup, so a coalesced or spurious notify cannot read as fresh
+  data.
+- The batch→game index map is round-tripped and `abort()`s on mismatch before
+  any result is consumed. A mis-scatter is the failure mode that would poison
+  data invisibly.
+- Single loop exit, read by all workers after a barrier, so all eight leave on
+  the same iteration. No `arrive_and_drop` anywhere.
+- Inference-thread exceptions fail both pools and release any blocked worker.
+
+`[dg]` now reports `gpu_wait` — time workers spent blocked on results. High is
+healthy (GPU-bound). If it approaches zero, tree work has become the bottleneck
+and a third pool would buy nothing.
+
+Also fixed: `total_nodes_evaluated` was `int`, overflowing at ~2.1B nodes.
+
+Remaining after this: anything inside the ONNX graph (a few %); overlapping the
+h2d/d2h copies needs async streams and a second capture — larger change,
+smallest prize.
 
 ## sz0_run4
 

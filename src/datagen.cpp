@@ -2,9 +2,14 @@
 #include "node.h"
 #include "search.h"
 
+#include <atomic>
 #include <barrier>
 #include <cmath>
+#include <condition_variable>
+#include <cstdlib>
 #include <fstream>
+#include <mutex>
+#include <string>
 #include <thread>
 
 int save_game_to_binary(const std::vector<TrainingPosition> &game_history,
@@ -243,14 +248,42 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
 
   auto begin = std::chrono::high_resolution_clock::now();
   auto last_print = begin;
-  int total_nodes_evaluated = 0;
-  bool flush_onnx_output = false;
+  std::atomic<U64> total_nodes_evaluated{0};
 
-  std::vector<std::unique_ptr<DatagenGame>> games;
-  games.reserve(datagenbatchsize);
-  for (int i = 0; i < datagenbatchsize; ++i) {
-    games.push_back(std::make_unique<DatagenGame>(datagenarenasize));
-  }
+  // --- Two independent game pools, alternating ---
+  //
+  // Inference is ~85% of a batch cycle and used to run with seven of eight
+  // workers parked at a barrier. It cannot be overlapped within one pool:
+  // select() for the next rollout depends on expand() of the current one. So
+  // there are two pools, and while the GPU evaluates pool p the workers do the
+  // tree work for pool 1-p. The GPU becomes the only thing on the critical
+  // path.
+  //
+  // Everything a batch touches is per-pool: the games, the packed input
+  // arrays, the index maps, and the evaluator slot the results land in. Nothing
+  // is shared between pools except the output file and the counters.
+  struct Pool {
+    std::vector<std::unique_ptr<DatagenGame>> games;
+    std::vector<U8> needs_nn;
+    std::vector<int32_t> pieces;
+    std::vector<int32_t> halfmoves;
+    // Dense batch row -> game index, and its inverse. Both are rebuilt every
+    // select phase; the round trip is asserted before any result is consumed.
+    std::vector<int> batch_to_game;
+    std::vector<int> game_to_batch;
+    std::atomic<int> batch_size{0};
+    int submitted_size = 0; // batch_size at submit, read by the consumer
+
+    Pool()
+        : needs_nn(datagenbatchsize, 0), pieces(datagenbatchsize * 64),
+          halfmoves(datagenbatchsize), batch_to_game(datagenbatchsize, -1),
+          game_to_batch(datagenbatchsize, -1) {
+      games.reserve(datagenbatchsize);
+      for (int i = 0; i < datagenbatchsize; ++i)
+        games.push_back(std::make_unique<DatagenGame>(datagenarenasize));
+    }
+  };
+  Pool pools[kBatchSlots];
 
   // --- Multi-threading Setup ---
   std::mutex file_mutex;
@@ -258,38 +291,44 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   std::atomic<int> positions_written{0};
   std::atomic<bool> keep_running{true};
 
-  std::vector<U8> shared_needs_nn(datagenbatchsize, 0);
-
   // Peak arena occupancy across every game and every root move, and the number
   // of times a leaf could not be expanded because the arena was full.
   std::atomic<size_t> peak_arena_nodes{0};
   std::atomic<U64> total_arena_overflows{0};
 
-  // Pre-allocated flat arrays for the GPU batch
-  std::vector<int32_t> batched_pieces(datagenbatchsize * 64);
-  std::vector<int32_t> batched_halfmoves(datagenbatchsize);
-
-  // Maps the dense GPU batch index (0 to current_batch_size) back to the global
-  // game index (0 to datagenbatchsize)
-  std::vector<int> batch_to_game_idx(datagenbatchsize);
-  // Inverse: which batch row a game's leaf landed in, so the parallel expand
-  // phase can find its own row in the evaluator's output buffer.
-  std::vector<int> game_to_batch_idx(datagenbatchsize, -1);
-  std::atomic<int> current_batch_size{0};
+  // Handshake between the workers and the dedicated inference thread, one per
+  // pool. `submitted` counts batches handed over, `completed` counts batches
+  // whose results are in the evaluator slot. A worker consumes pool p's results
+  // only once completed > the number it has already consumed, so a missed or
+  // duplicated wakeup cannot be mistaken for fresh data.
+  struct PoolSync {
+    std::mutex m;
+    std::condition_variable cv;
+    U64 submitted = 0;
+    U64 completed = 0;
+    bool failed = false;
+  };
+  PoolSync sync[kBatchSlots];
+  std::atomic<bool> inference_failed{false};
+  std::string inference_error;
 
   std::barrier sync_point(datagenthreads);
 
   // SZ0_TIME_IO=1 also turns on this loop-level breakdown, measured on thread 0
   // only. The `[io]` timer inside NNEvaluator covers just the inference phase,
   // which is the one phase independent of nodes/move — everything that scales
-  // with tree depth lives in select/expand and is invisible there. `*_wait` is
-  // time at a barrier, i.e. load imbalance across workers; `infer` is the
-  // window during which 7 of 8 threads are idle, and so is exactly what
-  // double-buffering could reclaim.
+  // with tree depth lives in select/expand and is invisible there.
+  //
+  // Now that inference is pipelined, `gpu_wait` is the headline number: it is
+  // time the workers spent blocked on results, i.e. the GPU being the
+  // bottleneck. That is the healthy state. If it goes to zero the tree work has
+  // become the bottleneck instead, and adding a third pool would do nothing.
+  // `*_wait` is barrier time, i.e. load imbalance between workers.
   struct DatagenTimer {
     bool on = false;
     long long report_every = 1000, iters = 0;
-    double select = 0, select_wait = 0, infer = 0, expand = 0, expand_wait = 0;
+    double select = 0, select_wait = 0, gpu_wait = 0, expand = 0,
+           expand_wait = 0;
     // Occupied rows per batch. Below datagenbatchsize because terminal leaves
     // backprop inside select() without an NN eval, and a game that has
     // finished its rollouts spends the iteration picking a move. The captured
@@ -310,19 +349,19 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
       if (++iters < report_every)
         return;
       double n = static_cast<double>(iters);
-      double total = select + select_wait + infer + expand + expand_wait;
+      double total = select + select_wait + gpu_wait + expand + expand_wait;
       // Report the nps this cycle time implies, so it can be checked against
       // the engine's own TRUE NPS without doing the arithmetic by hand.
       double implied_nps = batch_fill / n * 1e6 / (total / n);
       fprintf(stderr,
-              "[dg] n=%lld | select %.0f (+%.0f wait)  infer %.0f  "
-              "expand %.0f (+%.0f wait)  | cycle %.0f us, fill %.0f/%d, "
-              "idle-during-infer %.1f%%, implied %.0fK nps\n",
-              iters, select / n, select_wait / n, infer / n, expand / n,
-              expand_wait / n, total / n, batch_fill / n, datagenbatchsize,
-              100.0 * infer / total, implied_nps / 1000.0);
+              "[dg] n=%lld | select %.0f (+%.0f wait)  expand %.0f (+%.0f "
+              "wait)  gpu_wait %.0f  | cycle %.0f us, fill %.0f/%d, "
+              "gpu-bound %.1f%%, implied %.0fK nps\n",
+              iters, select / n, select_wait / n, expand / n, expand_wait / n,
+              gpu_wait / n, total / n, batch_fill / n, datagenbatchsize,
+              100.0 * gpu_wait / total, implied_nps / 1000.0);
       iters = 0;
-      select = select_wait = infer = expand = expand_wait = batch_fill = 0;
+      select = select_wait = gpu_wait = expand = expand_wait = batch_fill = 0;
     }
   } dg_timer;
   using dgclk = std::chrono::steady_clock;
@@ -334,10 +373,14 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   };
 
   auto worker = [&](int thread_idx) {
+    // Spread the remainder one game per thread instead of dumping all of it on
+    // the last one. At 284/8 the old split gave thread 7 thirty-nine games
+    // against everyone else's thirty-five, and since every phase ends at a
+    // barrier, all eight threads paid for the slowest.
     int chunk_size = datagenbatchsize / datagenthreads;
-    int start_idx = thread_idx * chunk_size;
-    int end_idx = (thread_idx == datagenthreads - 1) ? datagenbatchsize
-                                                     : start_idx + chunk_size;
+    int remainder = datagenbatchsize % datagenthreads;
+    int start_idx = thread_idx * chunk_size + std::min(thread_idx, remainder);
+    int end_idx = start_idx + chunk_size + (thread_idx < remainder ? 1 : 0);
 
     std::mt19937 rng(std::random_device{}() + thread_idx);
     std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
@@ -347,128 +390,76 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
     size_t local_peak_arena = 0;
     U64 local_overflows = 0;
 
-    for (int i = start_idx; i < end_idx; ++i) {
-      games[i]->reset(rng);
+    for (int p = 0; p < kBatchSlots; ++p) {
+      for (int i = start_idx; i < end_idx; ++i) {
+        pools[p].games[i]->reset(rng);
+      }
     }
 
     const bool dg_timing = dg_timer.on && thread_idx == 0;
     dgclk::time_point dg_t{};
 
-    while (true) {
+    // How many of each pool's completed batches this worker has already
+    // consumed. Compared against sync[p].completed rather than trusting a
+    // wakeup, so a spurious or coalesced notify cannot be read as fresh data.
+    U64 consumed[kBatchSlots] = {0, 0};
+
+    bool running = true;
+    for (U64 iter = 0; running; ++iter) {
+      // Pools strictly alternate. Pool p was last submitted at iter-kBatchSlots,
+      // so for the first kBatchSlots iterations there is nothing to consume —
+      // that is the pipeline filling.
+      const int p = static_cast<int>(iter % kBatchSlots);
+      Pool &pool = pools[p];
+
       if (dg_timing)
         dg_t = dgclk::now();
 
       // ==========================================
-      // MCTS Select (Parallelized)
+      // Wait for this pool's results (GPU is the bottleneck here)
       // ==========================================
-      for (int i = start_idx; i < end_idx; ++i) {
-        shared_needs_nn[i] = 0;
-        DatagenGame &g = *games[i];
-
-        // Retry rather than yielding the slot. select() finishes a rollout by
-        // itself when the leaf is terminal (bare king, 70-move, repetition,
-        // stalemate) — it backprops and returns false, having already counted
-        // the rollout. Leaving the batch row empty in that case wastes a row of
-        // a fixed-shape captured batch, which the GPU runs whether or not it is
-        // occupied. Terminal leaves get commoner as games reach endgames, which
-        // is why fill (and so nps) decays over a run.
-        //
-        // Bounded: the only false return increments rollouts_completed.
-        while (g.rollouts_completed < nodecount) {
-          if (select(g, rng)) {
-            shared_needs_nn[i] = 1;
-
-            // Lock-free atomic reservation for this board's slot in the batch
-            int b_idx =
-                current_batch_size.fetch_add(1, std::memory_order_relaxed);
-            batch_to_game_idx[b_idx] = i;
-            game_to_batch_idx[i] = b_idx;
-
-            // Thread computes perspective flips directly into the shared GPU
-            // buffer
-            for (int sq = 0; sq < 64; ++sq) {
-              int p_sq = g.leaf_pos.stm ? (sq ^ 56) : sq;
-              batched_pieces[(b_idx * 64) + p_sq] =
-                  perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm) +
-                  13 * p_sq;
-            }
-            batched_halfmoves[b_idx] = clamp_halfmove(g.leaf_pos.halfmovecount);
-            break; // slot filled; this game is done for the iteration
-          }
-        }
-      }
-
-      if (dg_timing)
-        dg_timer.select += dg_lap(dg_t);
-
-      if (!keep_running.load(std::memory_order_relaxed)) {
-        sync_point.arrive_and_drop();
-        break;
-      }
-      sync_point.arrive_and_wait();
-      if (dg_timing)
-        dg_timer.select_wait += dg_lap(dg_t);
-
-      // ==========================================
-      // GPU Inference (Thread 0 Only)
-      // ==========================================
-      if (thread_idx == 0) {
-        int batch_size = current_batch_size.load(std::memory_order_relaxed);
-        total_nodes_evaluated += batch_size;
-        if (dg_timing)
-          dg_timer.batch_fill += batch_size;
-
-        if (batch_size > 0) {
-          // Hand the pre-packed flat arrays directly to ONNX. The results are
-          // left in the evaluator's own buffers; the expand phase below reads
-          // them in parallel instead of having this thread scatter them while
-          // every other worker waits at the barrier.
-          nn.infer_packed(batched_pieces, batched_halfmoves);
-        }
-
-        // Reset the atomic batch size for the next MCTS loop
-        current_batch_size.store(0, std::memory_order_relaxed);
-
-        if (positions_written.load(std::memory_order_relaxed) >=
-            total_positions) {
+      const float *batch_policy = nullptr;
+      const float *batch_value = nullptr;
+      if (iter >= kBatchSlots) {
+        std::unique_lock<std::mutex> lk(sync[p].m);
+        sync[p].cv.wait(lk, [&] {
+          return sync[p].completed > consumed[p] || sync[p].failed;
+        });
+        if (sync[p].failed) {
+          lk.unlock();
+          // Leave via the same path as a normal stop so every worker still
+          // arrives at the barriers below the expected number of times.
           keep_running.store(false, std::memory_order_relaxed);
-        }
-        auto now = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            now - last_print)
-                            .count();
-        int nps =
-            1000 * total_nodes_evaluated /
-            std::chrono::duration_cast<std::chrono::milliseconds>(now - begin)
-                .count();
-        if (duration >= 1000) {
-          std::cout << "TRUE NPS: " << nps << "\r" << std::flush;
-          last_print = now;
+        } else {
+          consumed[p] = sync[p].completed;
+          lk.unlock();
+          batch_policy = nn.batch_policy(p);
+          batch_value = nn.batch_value(p);
         }
       }
 
       if (dg_timing)
-        dg_timer.infer += dg_lap(dg_t);
-
-      if (!keep_running.load(std::memory_order_relaxed)) {
-        sync_point.arrive_and_drop();
-        break;
-      }
-      sync_point.arrive_and_wait();
-      if (dg_timing)
-        dg_lap(dg_t); // barrier 2: the other threads are already waiting
+        dg_timer.gpu_wait += dg_lap(dg_t);
 
       // ==========================================
       // Expand & Move Check (Parallelized)
       // ==========================================
-      const float *batch_policy = nn.batch_policy();
-      const float *batch_value = nn.batch_value();
-
       for (int i = start_idx; i < end_idx; ++i) {
-        DatagenGame &g = *games[i];
+        DatagenGame &g = *pool.games[i];
 
-        if (shared_needs_nn[i] && g.rollouts_completed < nodecount) {
-          int b = game_to_batch_idx[i];
+        if (batch_policy && pool.needs_nn[i] && g.rollouts_completed < nodecount) {
+          int b = pool.game_to_batch[i];
+          // Round-trip the index map before touching any result. A mis-scatter
+          // here would put another game's policy into this game's tree and
+          // silently poison the training data rather than crash, so it is worth
+          // two array reads to make it impossible.
+          if (b < 0 || b >= pool.submitted_size || pool.batch_to_game[b] != i) {
+            fprintf(stderr,
+                    "FATAL: batch index map inconsistent (pool %d, game %d, "
+                    "row %d, size %d)\n",
+                    p, i, b, pool.submitted_size);
+            std::abort();
+          }
           expand(g, batch_policy + static_cast<size_t>(b) * 4096,
                  batch_value + static_cast<size_t>(b) * 3, local_overflows);
         }
@@ -579,14 +570,14 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
           }
 
           if (is_terminal) {
-            for (int p = 0; p < g.ply_count; ++p) {
+            for (int ply = 0; ply < g.ply_count; ++ply) {
               if (game_result == 0) {
-                g.game_history[p].outcome = 0;
+                g.game_history[ply].outcome = 0;
               } else {
-                bool is_white_turn = (p % 2 == 0);
-                g.game_history[p].outcome = (game_result == 1)
-                                                ? (is_white_turn ? 1 : -1)
-                                                : (is_white_turn ? -1 : 1);
+                bool is_white_turn = (ply % 2 == 0);
+                g.game_history[ply].outcome = (game_result == 1)
+                                                  ? (is_white_turn ? 1 : -1)
+                                                  : (is_white_turn ? -1 : 1);
               }
             }
 
@@ -619,13 +610,108 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
       if (dg_timing)
         dg_timer.expand += dg_lap(dg_t);
 
-      if (!keep_running.load(std::memory_order_relaxed)) {
-        sync_point.arrive_and_drop();
-        break;
-      }
       sync_point.arrive_and_wait();
-      if (dg_timing) {
+      if (dg_timing)
         dg_timer.expand_wait += dg_lap(dg_t);
+
+      // ==========================================
+      // MCTS Select (Parallelized) — builds pool p's next batch
+      // ==========================================
+      for (int i = start_idx; i < end_idx; ++i) {
+        pool.needs_nn[i] = 0;
+        DatagenGame &g = *pool.games[i];
+
+        // Retry rather than yielding the slot. select() finishes a rollout by
+        // itself when the leaf is terminal (bare king, 70-move, repetition,
+        // stalemate) — it backprops and returns false, having already counted
+        // the rollout. Leaving the batch row empty in that case wastes a row of
+        // a fixed-shape captured batch, which the GPU runs whether or not it is
+        // occupied. Terminal leaves get commoner as games reach endgames, which
+        // is why fill (and so nps) used to decay over a run.
+        //
+        // Bounded: the only false return increments rollouts_completed.
+        while (g.rollouts_completed < nodecount) {
+          if (select(g, rng)) {
+            pool.needs_nn[i] = 1;
+
+            // Lock-free atomic reservation for this board's slot in the batch
+            int b_idx = pool.batch_size.fetch_add(1, std::memory_order_relaxed);
+            pool.batch_to_game[b_idx] = i;
+            pool.game_to_batch[i] = b_idx;
+
+            // Thread computes perspective flips directly into the shared GPU
+            // buffer
+            for (int sq = 0; sq < 64; ++sq) {
+              int p_sq = g.leaf_pos.stm ? (sq ^ 56) : sq;
+              pool.pieces[(b_idx * 64) + p_sq] =
+                  perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm) +
+                  13 * p_sq;
+            }
+            pool.halfmoves[b_idx] = clamp_halfmove(g.leaf_pos.halfmovecount);
+            break; // slot filled; this game is done for the iteration
+          }
+        }
+      }
+
+      if (dg_timing)
+        dg_timer.select += dg_lap(dg_t);
+
+      sync_point.arrive_and_wait();
+      if (dg_timing)
+        dg_timer.select_wait += dg_lap(dg_t); // (submit + final barrier added
+                                              // below, so cycle stays exact)
+
+      // ==========================================
+      // Hand the batch to the inference thread (thread 0 only)
+      // ==========================================
+      if (thread_idx == 0) {
+        int batch_size = pool.batch_size.load(std::memory_order_relaxed);
+        // Written before `submitted` is incremented under the mutex, so the
+        // release/acquire pair publishes it to the inference thread.
+        pool.submitted_size = batch_size;
+        total_nodes_evaluated.fetch_add(batch_size, std::memory_order_relaxed);
+        if (dg_timing)
+          dg_timer.batch_fill += batch_size;
+        // Reset now, not before the next select: this pool is not touched again
+        // until kBatchSlots iterations later, with several barriers between.
+        pool.batch_size.store(0, std::memory_order_relaxed);
+
+        {
+          std::lock_guard<std::mutex> lk(sync[p].m);
+          ++sync[p].submitted;
+        }
+        sync[p].cv.notify_all();
+
+        if (positions_written.load(std::memory_order_relaxed) >=
+            total_positions) {
+          keep_running.store(false, std::memory_order_relaxed);
+        }
+        auto now = std::chrono::high_resolution_clock::now();
+        auto since_print = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               now - last_print)
+                               .count();
+        if (since_print >= 1000) {
+          auto elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(now - begin)
+                  .count();
+          if (elapsed_ms > 0) {
+            std::cout << "TRUE NPS: "
+                      << (1000 * total_nodes_evaluated.load(
+                                     std::memory_order_relaxed) /
+                          elapsed_ms)
+                      << "\r" << std::flush;
+          }
+          last_print = now;
+        }
+      }
+
+      // Single exit point, read identically by every worker after a barrier, so
+      // all eight leave the loop on the same iteration and the barrier count
+      // stays consistent. No arrive_and_drop needed anywhere.
+      sync_point.arrive_and_wait();
+      running = keep_running.load(std::memory_order_relaxed);
+      if (dg_timing) {
+        dg_timer.select_wait += dg_lap(dg_t);
         dg_timer.tick();
       }
     }
@@ -640,7 +726,56 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
     }
   };
 
+  // The one thread that touches the GPU. Pools alternate in the same order the
+  // workers submit them, so a batch is always waiting by the time the previous
+  // one finishes and the device never idles.
+  std::atomic<bool> inference_stop{false};
+  auto inference_loop = [&]() {
+    U64 processed[kBatchSlots] = {0, 0};
+    for (U64 iter = 0;; ++iter) {
+      const int p = static_cast<int>(iter % kBatchSlots);
+      {
+        std::unique_lock<std::mutex> lk(sync[p].m);
+        sync[p].cv.wait(lk, [&] {
+          return sync[p].submitted > processed[p] ||
+                 inference_stop.load(std::memory_order_relaxed);
+        });
+        if (sync[p].submitted <= processed[p])
+          return; // stopping, nothing left for this pool
+      }
+      ++processed[p];
+
+      try {
+        // An empty batch happens roughly once per nodecount iterations, when
+        // every game reaches its rollout budget together. Skip the Run but
+        // still publish completion, or the workers would wait forever.
+        if (pools[p].submitted_size > 0)
+          nn.infer_packed(pools[p].pieces, pools[p].halfmoves, p);
+      } catch (const std::exception &e) {
+        // Fail both pools: a worker may be blocked on either one.
+        inference_error = e.what();
+        inference_failed.store(true, std::memory_order_relaxed);
+        keep_running.store(false, std::memory_order_relaxed);
+        for (int q = 0; q < kBatchSlots; ++q) {
+          {
+            std::lock_guard<std::mutex> lk(sync[q].m);
+            sync[q].failed = true;
+          }
+          sync[q].cv.notify_all();
+        }
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lk(sync[p].m);
+        ++sync[p].completed;
+      }
+      sync[p].cv.notify_all();
+    }
+  };
+
   // --- Fire up the threads ---
+  std::thread inference_thread(inference_loop);
   std::vector<std::thread> threads;
   for (int i = 0; i < datagenthreads; ++i) {
     threads.emplace_back(worker, i);
@@ -649,6 +784,21 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   // --- Wait for the entire datagen run to finish ---
   for (auto &t : threads) {
     t.join();
+  }
+  // Only now can the inference thread be released: until every worker has
+  // stopped, one of them may still be waiting on a batch it submitted.
+  inference_stop.store(true, std::memory_order_relaxed);
+  for (int p = 0; p < kBatchSlots; ++p) {
+    {
+      std::lock_guard<std::mutex> lk(sync[p].m);
+    }
+    sync[p].cv.notify_all();
+  }
+  inference_thread.join();
+
+  if (inference_failed.load(std::memory_order_relaxed)) {
+    std::cerr << "\nERROR: inference thread failed: " << inference_error
+              << "\n";
   }
 
   size_t peak = peak_arena_nodes.load(std::memory_order_relaxed);
