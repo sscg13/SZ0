@@ -233,10 +233,43 @@ batch, so most likely clock throttle from sustaining 32% more work. Unconfirmed.
 phase. Memory bound is confirmed more strongly than that number suggested, and
 it caps `run` headroom at ~1.9×.
 
-Remaining per batch: 3670 GPU, ~440 host marshalling, ~466 tree work, all
-serial. Double-buffering to overlap the latter two with the next batch's GPU
-work has a ceiling of ~77K nps — now by far the largest single lever, and much
-bigger than anything left inside the graph.
+### Parallelised the result scatter
+
+`infer_packed` no longer scatters results into per-game structs — it exposes the
+batch via `batch_policy()`/`batch_value()` and each worker reads its own row
+during the parallel expand phase. Thread-0 serial time 4109 → ~3900 µs;
+host-side share of the inference phase 10.7% → ~6%. Also removed a dead
+zero-filled 4.65 MB vector from the non-graph path, and made that path hold its
+ORT output tensors in a member so it needs no copy either. Both paths are now
+zero-copy.
+
+### Careful: nps is only comparable at equal nodes/move
+
+The 62K figure was measured at **100** nodes/move; at 300 the same build reads
+60K. Nodes/move changes tree depth, which changes `select()` path length and
+`select_best_puct` scans — all in the parallel phase, which the `[io]` timer
+does not cover. Reconstructed from nps: unmeasured (tree) work is ~466 µs/batch
+at 100 nodes vs ~833 µs at 300. **Always state nodes/move alongside a datagen
+nps number.**
+
+`SZ0_TIME_IO=1` now also prints a `[dg]` line breaking the datagen loop into
+select / infer / expand plus barrier wait, measured on thread 0. That covers the
+phases the `[io]` timer structurally cannot.
+
+### Arena sizing
+
+Peak occupancy measured at **11211 / 65536 nodes** (300 nodes/move), i.e. ~37
+children per expansion, with zero overflows. `datagenarenasize` cut to 32768
+(2.9× headroom, ~800 nodes/move): 1536 → 768 KB per game, ~218 MB freed across
+284 games. `expand()` had a silent failure mode — a full arena skips adding
+children but still backprops, leaving a leaf that is re-selected forever — now
+counted and warned about rather than degrading quality invisibly.
+
+Remaining per batch (300 nodes/move): ~3900 µs GPU phase, ~833 µs tree work,
+serial. Double-buffering (two game pools, alternating batches) would hide the
+tree work: ceiling ~73K nps. The memory cost is what the arena cut just paid
+for. Overlapping the h2d/d2h copies as well needs async streams and a second
+capture — larger change, smaller remaining prize.
 
 ## sz0_run4
 
@@ -258,11 +291,12 @@ Open follow-ups:
   run4 to make more headway on this
 - increase data window and/or train longer (confounded — see below)
 - reserve a small slice of datagen for representative validation
-- datagen throughput budget — now 62K vs 95K originally (was 47K before the
-  inference-path fixes); decide explicitly rather than letting adoptions erode
-  it further
-- double-buffer datagen: overlap host marshalling + tree work with the next
-  batch's GPU work, ceiling ~77K nps — biggest remaining lever by far
+- datagen throughput budget — 60K at 300 nodes/move vs 95K originally (was 47K
+  before the inference-path fixes, but that was measured at a different
+  nodes/move — see the nps caveat below); decide explicitly rather than letting
+  adoptions erode it further
+- double-buffer datagen: two game pools alternating, so tree work hides under
+  the next batch's GPU work. Ceiling ~73K nps, biggest remaining lever
 - MoE: not optimistic (Leela failed; MoE adds params + traffic, the wrong
   trade for a memory-bound, data-limited net). Head specialization IS proven —
   NNUE output buckets are hard-routed head-MoE (hand-selected by piece count).

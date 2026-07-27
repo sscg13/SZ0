@@ -279,6 +279,49 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
 
   std::barrier sync_point(datagenthreads);
 
+  // SZ0_TIME_IO=1 also turns on this loop-level breakdown, measured on thread 0
+  // only. The `[io]` timer inside NNEvaluator covers just the inference phase,
+  // which is the one phase independent of nodes/move — everything that scales
+  // with tree depth lives in select/expand and is invisible there. `*_wait` is
+  // time at a barrier, i.e. load imbalance across workers; `infer` is the
+  // window during which 7 of 8 threads are idle, and so is exactly what
+  // double-buffering could reclaim.
+  struct DatagenTimer {
+    bool on = false;
+    long long report_every = 1000, iters = 0;
+    double select = 0, select_wait = 0, infer = 0, expand = 0, expand_wait = 0;
+    DatagenTimer() {
+      const char *v = std::getenv("SZ0_TIME_IO");
+      on = (v && v[0] == '1');
+      if (const char *e = std::getenv("SZ0_TIME_IO_EVERY")) {
+        long long p = atoll(e);
+        if (p > 0)
+          report_every = p;
+      }
+    }
+    void tick() {
+      if (++iters < report_every)
+        return;
+      double n = static_cast<double>(iters);
+      double total = select + select_wait + infer + expand + expand_wait;
+      fprintf(stderr,
+              "[dg] n=%lld | select %.0f (+%.0f wait)  infer %.0f  "
+              "expand %.0f (+%.0f wait)  | cycle %.0f us, idle-during-infer "
+              "%.1f%%\n",
+              iters, select / n, select_wait / n, infer / n, expand / n,
+              expand_wait / n, total / n, 100.0 * infer / total);
+      iters = 0;
+      select = select_wait = infer = expand = expand_wait = 0;
+    }
+  } dg_timer;
+  using dgclk = std::chrono::steady_clock;
+  auto dg_lap = [](dgclk::time_point &t) {
+    auto now = dgclk::now();
+    double d = std::chrono::duration<double, std::micro>(now - t).count();
+    t = now;
+    return d;
+  };
+
   auto worker = [&](int thread_idx) {
     int chunk_size = datagenbatchsize / datagenthreads;
     int start_idx = thread_idx * chunk_size;
@@ -297,7 +340,12 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
       games[i]->reset(rng);
     }
 
+    const bool dg_timing = dg_timer.on && thread_idx == 0;
+    dgclk::time_point dg_t{};
+
     while (true) {
+      if (dg_timing)
+        dg_t = dgclk::now();
 
       // ==========================================
       // MCTS Select (Parallelized)
@@ -330,11 +378,16 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         }
       }
 
+      if (dg_timing)
+        dg_timer.select += dg_lap(dg_t);
+
       if (!keep_running.load(std::memory_order_relaxed)) {
         sync_point.arrive_and_drop();
         break;
       }
       sync_point.arrive_and_wait();
+      if (dg_timing)
+        dg_timer.select_wait += dg_lap(dg_t);
 
       // ==========================================
       // GPU Inference (Thread 0 Only)
@@ -372,11 +425,16 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         }
       }
 
+      if (dg_timing)
+        dg_timer.infer += dg_lap(dg_t);
+
       if (!keep_running.load(std::memory_order_relaxed)) {
         sync_point.arrive_and_drop();
         break;
       }
       sync_point.arrive_and_wait();
+      if (dg_timing)
+        dg_lap(dg_t); // barrier 2: the other threads are already waiting
 
       // ==========================================
       // Expand & Move Check (Parallelized)
@@ -536,11 +594,18 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         }
       }
 
+      if (dg_timing)
+        dg_timer.expand += dg_lap(dg_t);
+
       if (!keep_running.load(std::memory_order_relaxed)) {
         sync_point.arrive_and_drop();
         break;
       }
       sync_point.arrive_and_wait();
+      if (dg_timing) {
+        dg_timer.expand_wait += dg_lap(dg_t);
+        dg_timer.tick();
+      }
     }
 
     // Every exit above breaks out of the loop, so one merge here covers all of

@@ -50,7 +50,12 @@ enum PieceType : U8 {
   King = 7
 };
 constexpr int defaultarenasize = 3145728;
-constexpr int datagenarenasize = 65536;
+// 2.9x the peak occupancy measured at 300 nodes/move (11211 nodes over a full
+// datagen run). The arena is cleared once per root move, so this bounds a
+// single search, and usage scales ~linearly with nodes/move: ~37 children per
+// expansion here, so 32768 covers up to roughly 800. Overflow is no longer
+// silent — generate_batched_selfplay_games counts dropped expansions and warns.
+constexpr int datagenarenasize = 32768;
 constexpr int datagenbatchsize = 284;
 constexpr int datagenthreads = 8;
 // Must match the batch dimension the search ONNX model was exported with.
