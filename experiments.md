@@ -399,7 +399,7 @@ Open follow-ups:
   For a data-limited net prefer a hand-designed router over a learned gate.
   Caveat: a deep trunk may already learn phase-conditioning implicitly, so less
   headroom than shallow NNUE. 
-- per-layer `d_ff` schedule (wider in deeper layers) — fixed-budget reallocation
+- per-layer `d_ff` schedule (wider in EARLY layers) — fixed-budget reallocation
   so ~neutral throughput, but the effect is sub-floor: needs multi-seed or a
   large reallocation to detect
 - widen `d_model` — raises intensity but also traffic, 

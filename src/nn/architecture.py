@@ -137,7 +137,12 @@ class ShatranjNet(nn.Module):
     num_heads: int = 8
     # int = uniform width; tuple of length num_layers = per-layer widths
     # (see cosine_ff_schedule). Must be a tuple, not a list — Flax hashes it.
-    d_ff: Union[int, Sequence[int]] = 256
+    # Tapered wide -> narrow: (384, 384, 384, 320, 256, 256, 192, 128, 128, 128).
+    # Sums to 10*256, so parameters, FLOPs and memory traffic are unchanged
+    # against uniform d_ff=256 — this is purely a reallocation of capacity
+    # toward the early layers. The 10 must match num_layers; the block loop
+    # raises if it does not.
+    d_ff: Union[int, Sequence[int]] = cosine_ff_schedule(10, 256)
     d_qk_head: int = 64
     d_v_head: int = None
     # jnp.bfloat16 runs the trunk in mixed precision: weights stay float32, only
