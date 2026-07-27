@@ -70,12 +70,30 @@ class NNEvaluator {
   void *d_policy_ = nullptr;
   void *d_value_ = nullptr;
 
+  // Page-locked landing buffers for the D2H copy, allocated once at setup.
+  // Two reasons, in order of how much they were worth measuring:
+  //  1. They are persistent, so the per-call malloc + zero-fill of a ~4.65 MB
+  //     staging vector disappears (measured ~245 us/batch at 284), as does the
+  //     copy out of it into a temporary (~350 us) — callers read these buffers
+  //     directly.
+  //  2. Pinned memory lets the driver DMA without staging through its own
+  //     bounce buffer: pageable measured ~12.6 GB/s, pinned should roughly
+  //     double it (~370 -> ~190 us).
+  float *h_policy_ = nullptr;
+  float *h_value_ = nullptr;
+
   // Returns false if anything about capture setup fails; caller then keeps
   // using the ordinary Run path.
   bool setup_cuda_graph(int batch);
-  std::vector<NNOutput> infer_bound(const std::vector<int32_t> &flat_pieces,
-                                    const std::vector<int32_t> &flat_halfmoves,
-                                    int real_count);
+
+  // Uploads, runs the captured graph, and lands the outputs in h_policy_ /
+  // h_value_ (row b at h_policy_ + b*4096). Inputs must already be padded to
+  // graph_batch_; only the first real_count rows are copied back. The caller
+  // must hold graph_mutex_ for the call *and* for as long as it reads the
+  // buffers afterwards, since they are shared across calls.
+  void run_bound_locked(const std::vector<int32_t> &flat_pieces,
+                        const std::vector<int32_t> &flat_halfmoves,
+                        int real_count);
 #endif
 
   // According to ONNX
@@ -200,6 +218,13 @@ public:
     std::vector<int32_t> warm_halfmoves(warm_batch, 0);
     infer_dynamic_batch(warm_pieces, warm_halfmoves, warm_batch);
   }
+
+#ifdef USE_CUDA
+  // Frees the pinned host buffers. Safe only because uci() calls nn.reset()
+  // before static teardown — see the comment there; anything CUDA touched
+  // during exit-time destruction fails with "driver shutting down".
+  ~NNEvaluator();
+#endif
 
   NNOutput infer(const Position &pos);
   void infer_packed(const std::vector<int32_t> &flat_pieces,

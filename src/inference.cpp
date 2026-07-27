@@ -79,7 +79,12 @@ NNOutput NNEvaluator::infer(const Position &pos) {
     std::vector<int32_t> halfmoves(graph_batch_, 0);
     std::copy(board_data, board_data + 64, pieces.begin());
     halfmoves[0] = halfmove_data[0];
-    return infer_bound(pieces, halfmoves, 1)[0];
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    run_bound_locked(pieces, halfmoves, 1);
+    NNOutput result;
+    std::copy(h_policy_, h_policy_ + 4096, result.policy);
+    std::copy(h_value_, h_value_ + 3, result.value);
+    return result;
   }
 #endif
 
@@ -120,6 +125,16 @@ bool NNEvaluator::setup_cuda_graph(int batch) {
     d_value_ = cuda_alloc_->Alloc(n * 3 * sizeof(float));
     if (!d_board_ || !d_half_ || !d_policy_ || !d_value_)
       return false;
+
+    if (cudaHostAlloc(reinterpret_cast<void **>(&h_policy_),
+                      n * 4096 * sizeof(float), cudaHostAllocDefault) !=
+            cudaSuccess ||
+        cudaHostAlloc(reinterpret_cast<void **>(&h_value_),
+                      n * 3 * sizeof(float),
+                      cudaHostAllocDefault) != cudaSuccess) {
+      fprintf(stderr, "cudaHostAlloc failed for the D2H staging buffers\n");
+      return false;
+    }
 
     // Policy is [batch, 64, 64]; the engine treats it as 4096 flat per position.
     std::array<int64_t, 2> board_shape{batch, 64};
@@ -176,12 +191,10 @@ struct IoTimer {
   bool on = false;
   long long report_every = 1000;
   long long calls = 0;
-  // Phases, in execution order.
-  double h2d = 0, run = 0, alloc_results = 0, alloc_stage = 0, d2h = 0,
-         copy_out = 0;
-  // Charged by infer_packed: the extra scatter the graph path pays that the
-  // ordinary Run path does not (it copies straight out of the ORT tensor).
-  double scatter = 0;
+  // Phases, in execution order. Exactly one of copy_out / scatter is charged
+  // per call: copy_out by the search path, which must build a vector, and
+  // scatter by datagen, which writes straight into shared_results.
+  double h2d = 0, run = 0, d2h = 0, copy_out = 0, scatter = 0;
 
   IoTimer() {
     const char *v = std::getenv("SZ0_TIME_IO");
@@ -197,35 +210,24 @@ struct IoTimer {
     if (++calls < report_every)
       return;
     double n = static_cast<double>(calls);
-    double host = h2d + alloc_results + alloc_stage + d2h + copy_out + scatter;
+    double host = h2d + d2h + copy_out + scatter;
     double total = host + run;
     fprintf(stderr,
-            "[io] batch %d n=%lld | h2d %.0f  run %.0f  results %.0f  "
-            "stage %.0f  d2h %.0f  copy %.0f  scatter %.0f  "
-            "| total %.0f us, host-side %.1f%%\n",
-            batch, calls, h2d / n, run / n, alloc_results / n, alloc_stage / n,
-            d2h / n, copy_out / n, scatter / n, total / n,
-            100.0 * host / total);
+            "[io] batch %d n=%lld | h2d %.0f  run %.0f  d2h %.0f  copy %.0f  "
+            "scatter %.0f  | total %.0f us, host-side %.1f%%\n",
+            batch, calls, h2d / n, run / n, d2h / n, copy_out / n, scatter / n,
+            total / n, 100.0 * host / total);
     calls = 0;
-    h2d = run = alloc_results = alloc_stage = d2h = copy_out = scatter = 0;
+    h2d = run = d2h = copy_out = scatter = 0;
   }
 };
 
 IoTimer io_timer;
-
-// Set by infer_packed so infer_bound defers reporting until the scatter that
-// follows it has been charged. Datagen calls infer_packed from one thread only
-// and search never calls it at all, so this needs no synchronisation.
-bool io_in_packed = false;
 } // namespace
 
-// Runs the captured graph. Inputs are padded to graph_batch_ by the caller;
-// only the first real_count results are returned.
-std::vector<NNOutput>
-NNEvaluator::infer_bound(const std::vector<int32_t> &flat_pieces,
-                         const std::vector<int32_t> &flat_halfmoves,
-                         int real_count) {
-  std::lock_guard<std::mutex> lock(graph_mutex_);
+void NNEvaluator::run_bound_locked(const std::vector<int32_t> &flat_pieces,
+                                   const std::vector<int32_t> &flat_halfmoves,
+                                   int real_count) {
   const size_t n = static_cast<size_t>(graph_batch_);
   const bool timing = io_timer.on;
   clk::time_point t{};
@@ -244,39 +246,21 @@ NNEvaluator::infer_bound(const std::vector<int32_t> &flat_pieces,
   if (timing)
     io_timer.run += us_since(&t);
 
-  // Value-initialized, so this zero-fills real_count * 16 KB before anything
-  // is written to it.
-  std::vector<NNOutput> results(real_count);
-  if (timing)
-    io_timer.alloc_results += us_since(&t);
-
-  const size_t policy_floats = static_cast<size_t>(real_count) * 4096;
-  const size_t value_floats = static_cast<size_t>(real_count) * 3;
-  std::vector<float> policy(policy_floats), value(value_floats);
-  if (timing)
-    io_timer.alloc_stage += us_since(&t);
-
-  cudaMemcpy(policy.data(), d_policy_, policy_floats * sizeof(float),
+  cudaMemcpy(h_policy_, d_policy_,
+             static_cast<size_t>(real_count) * 4096 * sizeof(float),
              cudaMemcpyDeviceToHost);
-  cudaMemcpy(value.data(), d_value_, value_floats * sizeof(float),
+  cudaMemcpy(h_value_, d_value_,
+             static_cast<size_t>(real_count) * 3 * sizeof(float),
              cudaMemcpyDeviceToHost);
   if (timing)
     io_timer.d2h += us_since(&t);
+}
 
-  for (int b = 0; b < real_count; ++b) {
-    std::copy(policy.begin() + b * 4096, policy.begin() + (b + 1) * 4096,
-              results[b].policy);
-    std::copy(value.begin() + b * 3, value.begin() + (b + 1) * 3,
-              results[b].value);
-  }
-  if (timing) {
-    io_timer.copy_out += us_since(&t);
-    // infer_packed adds its scatter before reporting; search has none, so
-    // report here only when nobody else will.
-    if (!io_in_packed)
-      io_timer.tick(graph_batch_);
-  }
-  return results;
+NNEvaluator::~NNEvaluator() {
+  if (h_policy_)
+    cudaFreeHost(h_policy_);
+  if (h_value_)
+    cudaFreeHost(h_value_);
 }
 #endif
 
@@ -285,8 +269,27 @@ NNEvaluator::infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
                                  const std::vector<int32_t> &flat_halfmoves,
                                  int batch_size) {
 #ifdef USE_CUDA
-  if (cuda_graph_ && batch_size == graph_batch_)
-    return infer_bound(flat_pieces, flat_halfmoves, batch_size);
+  if (cuda_graph_ && batch_size == graph_batch_) {
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    run_bound_locked(flat_pieces, flat_halfmoves, batch_size);
+    clk::time_point t{};
+    if (io_timer.on)
+      t = clk::now();
+    // This path owes its caller a vector, so unlike infer_packed it cannot
+    // avoid materialising one. It is the search path (one small batch per
+    // call), where the marshalling is a much smaller share than at batch 284.
+    std::vector<NNOutput> results(batch_size);
+    for (int b = 0; b < batch_size; ++b) {
+      std::copy(h_policy_ + b * 4096, h_policy_ + (b + 1) * 4096,
+                results[b].policy);
+      std::copy(h_value_ + b * 3, h_value_ + (b + 1) * 3, results[b].value);
+    }
+    if (io_timer.on) {
+      io_timer.copy_out += us_since(&t);
+      io_timer.tick(graph_batch_);
+    }
+    return results;
+  }
 #endif
   std::array<int64_t, 2> board_shape{batch_size, 64};
   std::array<int64_t, 1> halfmove_shape{batch_size};
@@ -325,20 +328,21 @@ void NNEvaluator::infer_packed(const std::vector<int32_t> &flat_pieces,
                                const std::vector<int> &batch_to_game_idx) {
 #ifdef USE_CUDA
   if (cuda_graph_ && graph_batch_ == datagenbatchsize) {
-    // NOTE: this path copies the policy block one more time than the ordinary
-    // Run path below, which scatters straight out of the ORT output tensor.
-    // At batch 284 that is an extra ~4.65 MB per call. SZ0_TIME_IO=1 prices it
-    // as the `scatter` column.
-    io_in_packed = io_timer.on;
-    auto results = infer_bound(flat_pieces, flat_halfmoves, datagenbatchsize);
+    // Scatter straight out of the pinned landing buffer, matching what the
+    // ordinary Run path below does with the ORT output tensor. The lock must
+    // cover the reads, not just the Run: the buffers are shared across calls.
+    std::lock_guard<std::mutex> lock(graph_mutex_);
+    run_bound_locked(flat_pieces, flat_halfmoves, datagenbatchsize);
     clk::time_point t{};
     if (io_timer.on)
       t = clk::now();
-    for (int b = 0; b < datagenbatchsize; ++b)
-      shared_results[batch_to_game_idx[b]] = results[b];
+    for (int b = 0; b < datagenbatchsize; ++b) {
+      NNOutput &dst = shared_results[batch_to_game_idx[b]];
+      std::copy(h_policy_ + b * 4096, h_policy_ + (b + 1) * 4096, dst.policy);
+      std::copy(h_value_ + b * 3, h_value_ + (b + 1) * 3, dst.value);
+    }
     if (io_timer.on) {
       io_timer.scatter += us_since(&t);
-      io_in_packed = false;
       io_timer.tick(datagenbatchsize);
     }
     return;

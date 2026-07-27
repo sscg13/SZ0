@@ -175,10 +175,39 @@ Two blockers had to be cleared first:
   every GPU exit, ORT just logged instead of throwing.
 
 Predicted 2.2× from a `c = 0.59 ms` fixed-cost fit; got 10–15%, so launch
-overhead is only ~0.1–0.15 ms of that. The rest is memcpy (the policy D2H alone
-is 32 × 4096 × 4 B = 524 KB), ORT per-`Run` bookkeeping, and worker tree work
-that fails to overlap. **Next lever is the memcpy traffic, not the launches** —
-fp16 policy output would halve the D2H.
+overhead was only ~0.1–0.15 ms of it. Fitting a fixed cost says nothing about
+what the cost *is* — see below for where it actually went.
+
+### Where a batched inference call spends its time (`SZ0_TIME_IO=1`)
+
+Per-phase timing of the captured-graph path, datagen batch 284, steady state
+over 29K batches (very stable, ±2%):
+
+| Phase | µs | Share |
+|---|---|---|
+| `run` (GPU) | 3550 | 72.5% |
+| `d2h` (4.65 MB) | 370 | 7.6% |
+| `copy` staging → temporary | 350 | 7.1% |
+| `scatter` temporary → `shared_results` | 240 | 4.9% |
+| `stage` malloc + zero-fill 4.65 MB | 245 | 5.0% |
+| `results` zero-fill 4.66 MB | 127 | 2.6% |
+| `h2d` (73 KB) | 20 | 0.4% |
+
+**The transfer was never the problem.** 4.65 MB in 370 µs is 12.6 GB/s, already
+respectable for pageable memory. The cost was the three redundant host passes
+around it (`results` + `stage` + `copy` = 722 µs, ~2× the transfer): two
+zero-fills of buffers that are overwritten immediately, and a copy into a
+temporary that exists only to be scattered out of.
+
+Fix: one persistent pinned landing buffer allocated at setup, each caller
+scattering directly out of it. Removes all three, and pinning should roughly
+halve the transfer. Host-side ~1350 → ~450 µs, i.e. ~15% of the full 6040 µs
+datagen batch cycle (the ~1140 µs this timer does not see is tree work).
+
+Also measured `run` = 1684 MB / 3550 µs = **474 GB/s, 55% of the L40S's 864** —
+higher than the 41% below, which was computed against the whole batch cycle
+rather than the GPU phase. Memory bound is confirmed more strongly than that
+number suggested, and it caps `run` headroom at ~1.8×.
 
 ## sz0_run4
 
@@ -207,7 +236,8 @@ Open follow-ups:
   large reallocation to detect
 - widen `d_model` — raises intensity but also traffic, 
   will be pretty costly for datagen, unless nodes can decrease
-- fp16 policy output to halve the D2H memcpy (see CUDA graph section)
+- double-buffer datagen so host marshalling overlaps the next batch's GPU work
+  (the remaining ~450 µs/batch is serial with `run` today)
 
 ### The baseline anchor is ~67 Elo below the iterative net
 
@@ -315,6 +345,11 @@ The model is far too small to saturate the L40S. Estimated from the shapes in
 Bandwidth barely moves between the two depths while compute stays ~17%, so the
 1.61× depth scaling above is not evidence of being compute bound. Arithmetic
 intensity 46–92 FLOP/byte against an equilibrium of 209.
+
+These are computed against the *whole* datagen batch cycle, so they understate
+utilisation during the GPU phase itself — measured separately as 55% of peak
+bandwidth (see `SZ0_TIME_IO` above). Roughly 28% of the cycle was host-side
+marshalling, now largely removed.
 
 Depth costs close to full price (1.61× for +67% FLOPs). Width is *partially*
 discounted but **not** free: `d_ff` 256→512 (+31% FLOPs) measured ≥~7% slower
