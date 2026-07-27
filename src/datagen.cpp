@@ -290,6 +290,13 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
     bool on = false;
     long long report_every = 1000, iters = 0;
     double select = 0, select_wait = 0, infer = 0, expand = 0, expand_wait = 0;
+    // Occupied rows per batch. Below datagenbatchsize because terminal leaves
+    // backprop inside select() without an NN eval, and a game that has
+    // finished its rollouts spends the iteration picking a move. The captured
+    // graph runs all datagenbatchsize rows regardless, so the shortfall is
+    // wasted GPU work — and it is also why reported nps is lower than
+    // datagenbatchsize/cycle would imply.
+    double batch_fill = 0;
     DatagenTimer() {
       const char *v = std::getenv("SZ0_TIME_IO");
       on = (v && v[0] == '1');
@@ -304,14 +311,18 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         return;
       double n = static_cast<double>(iters);
       double total = select + select_wait + infer + expand + expand_wait;
+      // Report the nps this cycle time implies, so it can be checked against
+      // the engine's own TRUE NPS without doing the arithmetic by hand.
+      double implied_nps = batch_fill / n * 1e6 / (total / n);
       fprintf(stderr,
               "[dg] n=%lld | select %.0f (+%.0f wait)  infer %.0f  "
-              "expand %.0f (+%.0f wait)  | cycle %.0f us, idle-during-infer "
-              "%.1f%%\n",
+              "expand %.0f (+%.0f wait)  | cycle %.0f us, fill %.0f/%d, "
+              "idle-during-infer %.1f%%, implied %.0fK nps\n",
               iters, select / n, select_wait / n, infer / n, expand / n,
-              expand_wait / n, total / n, 100.0 * infer / total);
+              expand_wait / n, total / n, batch_fill / n, datagenbatchsize,
+              100.0 * infer / total, implied_nps / 1000.0);
       iters = 0;
-      select = select_wait = infer = expand = expand_wait = 0;
+      select = select_wait = infer = expand = expand_wait = batch_fill = 0;
     }
   } dg_timer;
   using dgclk = std::chrono::steady_clock;
@@ -395,6 +406,8 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
       if (thread_idx == 0) {
         int batch_size = current_batch_size.load(std::memory_order_relaxed);
         total_nodes_evaluated += batch_size;
+        if (dg_timing)
+          dg_timer.batch_fill += batch_size;
 
         if (batch_size > 0) {
           // Hand the pre-packed flat arrays directly to ONNX. The results are

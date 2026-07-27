@@ -256,6 +256,22 @@ nps number.**
 select / infer / expand plus barrier wait, measured on thread 0. That covers the
 phases the `[io]` timer structurally cannot.
 
+Two gotchas when reading it:
+
+- **`nps` counts NN evals, not iterations**, so `datagenbatchsize / cycle`
+  overstates it. `select()` backprops terminal leaves (bare king, 70-move,
+  repetition, stalemate) without an NN eval, and a game that has finished its
+  rollouts spends that iteration choosing a move. Mean fill ≈ 266/284 (94%) at
+  300 nodes/move — which fully explains cycle 4400 µs reading as 60K rather
+  than 64.5K. The captured graph runs all 284 rows regardless, so ~6% of `run`
+  is padding; not recoverable without giving up graph capture. The `[dg]` line
+  now reports fill and implied nps directly.
+- **Set `SZ0_TIME_IO_EVERY` to a multiple of nodes/move.** The arena clears
+  every root move, so tree depth sweeps shallow→deep with period exactly
+  `nodecount`, and all games stay in lockstep (one rollout each per iteration).
+  Reporting every 1000 at 300 nodes/move aliases that cycle and makes `select`
+  swing 60–464 µs between windows. 3000 gives ten whole periods.
+
 ### Arena sizing
 
 Peak occupancy measured at **11211 / 65536 nodes** (300 nodes/move), i.e. ~37
