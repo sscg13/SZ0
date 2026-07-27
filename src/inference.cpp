@@ -62,7 +62,7 @@ MCTSEval parse_nn_output(const NNOutput &raw_nn, const Move *moves,
 
 NNOutput NNEvaluator::infer(const Position &pos) {
   int32_t board_data[64];
-  int32_t halfmove_data[1] = {static_cast<int32_t>(pos.halfmovecount)};
+  int32_t halfmove_data[1] = {clamp_halfmove(pos.halfmovecount)};
 
   for (int i = 0; i < 64; ++i) {
     int perspective_square = pos.stm ? (i ^ 56) : i;
@@ -277,7 +277,7 @@ void NNEvaluator::infer_packed(const std::vector<int32_t> &flat_pieces,
 
 std::future<NNOutput> BatchEvaluator::submit(const Position &pos) {
   int32_t board_data[64];
-  int32_t halfmove = static_cast<int32_t>(pos.halfmovecount);
+  int32_t halfmove = clamp_halfmove(pos.halfmovecount);
 
   for (int i = 0; i < 64; ++i) {
     int ps = pos.stm ? (i ^ 56) : i;

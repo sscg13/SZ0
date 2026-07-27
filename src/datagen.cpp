@@ -305,7 +305,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
                   perspectivepiece(g.leaf_pos.pieces[sq], g.leaf_pos.stm) +
                   13 * p_sq;
             }
-            batched_halfmoves[b_idx] = g.leaf_pos.halfmovecount;
+            batched_halfmoves[b_idx] = clamp_halfmove(g.leaf_pos.halfmovecount);
           }
         }
       }

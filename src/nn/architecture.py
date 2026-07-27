@@ -128,9 +128,14 @@ class ShatranjNet(nn.Module):
 
     @nn.compact
     def __call__(self, board_tokens, halfmove_token):
-        # Guard just in case
-        safe_board_tokens = jnp.clip(board_tokens, 0, self.vocab_size - 1)
-        safe_halfmove_token = jnp.clip(halfmove_token, 0, self.max_halfmoves - 1)
+        # No clipping guard here: int32 Clip has no CUDA kernel, so ORT put
+        # it on the CPU provider and inserted MemcpyFromHost, which blocks
+        # CUDA graph capture. The engine clamps halfmove instead (see
+        # clamp_halfmove in src/inference.h); board tokens are bounded by
+        # construction. Behaviour is unchanged either way, since JAX's
+        # gather clamps out-of-range indices anyway.
+        safe_board_tokens = board_tokens
+        safe_halfmove_token = halfmove_token
 
         # Embeddings & Setup (using the safe tokens)
         x = nn.Embed(num_embeddings=self.vocab_size, features=self.d_model)(safe_board_tokens)

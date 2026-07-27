@@ -1,5 +1,6 @@
 #include "position.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -27,6 +28,19 @@ struct MCTSEval {
 
 MCTSEval parse_nn_output(const NNOutput &raw_nn, const Move *moves,
                          int movecount, bool stm);
+
+// The halfmove embedding has max_halfmoves = 140 rows (valid 0..139), but the
+// seventy-move rule lets halfmovecount reach 140. The model used to clamp this
+// internally with a Clip node; int32 Clip has no CUDA kernel, so ORT placed it
+// on the CPU provider, which inserted MemcpyFromHost and made CUDA graph
+// capture impossible. Clamping here instead keeps the whole graph on CUDA.
+// Board tokens need no guard — perspectivepiece(..) + 13*square is bounded to
+// 0..13*64-1 by construction.
+inline int32_t clamp_halfmove(int halfmovecount) {
+  constexpr int max_halfmoves = 140;
+  return static_cast<int32_t>(
+      std::clamp(halfmovecount, 0, max_halfmoves - 1));
+}
 
 class NNEvaluator {
   Ort::Env env;
