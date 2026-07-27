@@ -159,3 +159,48 @@ class SparseInMemoryDataLoader:
                 'target_pi': dense_pi,
                 'legal_mask': legal_mask
             }
+
+
+def prefetch(iterable, depth=3):
+    """Run `iterable` on a background thread, buffering up to `depth` items.
+
+    Batch assembly above is pure numpy — a Python loop over every sample plus
+    ~6 MB of zeroed dense targets — and it releases the GIL inside the numpy
+    calls. On the main thread it sits on the critical path between GPU steps;
+    here it overlaps with them. Worth nothing on its own: if the training loop
+    blocks on the device every step, there is no window to overlap into.
+    """
+    import queue
+    import threading
+
+    q = queue.Queue(maxsize=depth)
+    sentinel = object()
+    error = []
+
+    def produce():
+        try:
+            for item in iterable:
+                q.put(item)
+        except BaseException as e:  # re-raised on the consumer thread
+            error.append(e)
+        finally:
+            q.put(sentinel)
+
+    thread = threading.Thread(target=produce, daemon=True)
+    thread.start()
+    try:
+        while True:
+            item = q.get()
+            if item is sentinel:
+                if error:
+                    raise error[0]
+                return
+            yield item
+    finally:
+        # Unblock the producer if the consumer stops early (break, exception),
+        # otherwise it parks forever on a full queue and the process hangs.
+        while thread.is_alive():
+            try:
+                q.get_nowait()
+            except Exception:
+                break

@@ -11,8 +11,10 @@ os.environ["JAX_TRACEBACK_FILTERING"] = "off"
 import argparse
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax.training import train_state
+from functools import partial
 import time
 import math
 import orbax.checkpoint as ocp
@@ -20,6 +22,7 @@ import glob
 
 from dataloader import load_sparse_dataset
 from dataloader import SparseInMemoryDataLoader
+from dataloader import prefetch
 from architecture import ShatranjNet
 
 def compute_loss(params, apply_fn, batch):
@@ -68,7 +71,11 @@ def compute_loss(params, apply_fn, batch):
     return total_loss, (policy_loss, combined_value_loss, wdl_loss, q_mse_loss)
 
 # --- 2. The JIT-Compiled Training Step ---
-@jax.jit
+# donate_argnums=(0,) lets XLA write the updated params and Adam moments into
+# the buffers they arrived in, instead of allocating a fresh set every step.
+# Safe because the caller always rebinds `state` to the return value and never
+# reuses the one it passed in.
+@partial(jax.jit, donate_argnums=(0,))
 def train_step(state, batch):
     """
     Calculates gradients and updates the weights. @jax.jit makes this lightning fast.
@@ -76,12 +83,12 @@ def train_step(state, batch):
     # jax.value_and_grad computes both the loss and the gradients of the params
     # has_aux=True tells JAX that compute_loss returns a tuple, and to only differentiate the first item
     grad_fn = jax.value_and_grad(compute_loss, has_aux=True)
-    
+
     (loss, (p_loss, v_loss, wdl_loss, q_loss)), grads = grad_fn(state.params, state.apply_fn, batch)
-    
+
     # Apply gradients using the optimizer to get the new state
     state = state.apply_gradients(grads=grads)
-    
+
     return state, loss, p_loss, v_loss, wdl_loss, q_loss
 
 # --- 3. The Main Training Engine ---
@@ -166,23 +173,35 @@ def train(checkpoint_manager, visit_temperature=1.0):
     local_step = 0
     start_time = time.time()
         
-    for batch in dataloader.get_batches():
-        if jnp.isnan(batch['target_pi']).any() or jnp.isnan(batch['target_z']).any():
-            print(f"CRITICAL: NaN found in data at step {local_step}!")
-            break
+    # Batch assembly is pure numpy and takes real time (a Python loop over every
+    # sample, plus ~6 MB of zeroed dense targets). Run it on a background thread
+    # so it overlaps the GPU step instead of sitting between two of them.
+    for batch in prefetch(dataloader.get_batches(), depth=3):
+        # Checked on the host with numpy, and only when we are about to
+        # synchronise anyway. `jnp.isnan(...).any()` in a Python `if` forces a
+        # device->host sync *before* train_step is even dispatched, which alone
+        # serialises the whole loop.
+        if local_step % 100 == 0:
+            if np.isnan(batch['target_pi']).any() or np.isnan(batch['target_z']).any():
+                print(f"CRITICAL: NaN found in data at step {local_step}!")
+                break
 
         state, loss, p_loss, v_loss, wdl_loss, q_loss = train_step(state, batch)
-        loss.block_until_ready()
 
         local_step += 1
-        
+
+        # Block only here. JAX dispatches asynchronously, so blocking every step
+        # stops the host from queueing the next one while the GPU is busy —
+        # every batch then costs host time + device time instead of the larger
+        # of the two.
         if local_step % 100 == 0:
+            loss.block_until_ready()
             elapsed = time.time() - start_time
             print(f"Step {local_step:04d} | Total: {loss:.4f} "
                   f"[Pol: {p_loss:.4f} | Val: {v_loss:.4f} (WDL: {wdl_loss:.4f}, Q: {q_loss:.4f})] "
                   f"| Time: {elapsed:.2f}s")
             start_time = time.time()
-        
+
         if local_step == batches:
             break
 

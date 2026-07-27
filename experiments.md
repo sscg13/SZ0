@@ -313,7 +313,30 @@ of N), so there are now two pools: while the GPU evaluates pool p, the workers
 do tree work for pool 1-p. Inference moved to its own thread; the middle barrier
 became a per-pool submitted/completed handshake.
 
-Ceiling is the GPU phase alone: 284/3880 µs ≈ **73K nps from 62K (+17%)**.
+Measured **70K nps from 62K (+13%)**, at `gpu-bound 97%` — tree work is fully
+hidden and the GPU is the only thing left on the critical path.
+
+Verified correct: end-of-run peak arena 11020/32768, statistically identical to
+the 11211 measured before the change, so trees are growing normally. (The check
+mattered because a broken `expand` would have produced a fast-looking loop, a
+perfect 284/284 fill, and worthless data.) `select` fell ~290 → ~50 µs and
+`expand` ~180 → ~28 µs across this change. **This is a rate effect, not less
+work:** identical peak arena means identical tree sizes, so `select` walks the
+same trees; and all four CPU columns scaled by the same factor, which real work
+reductions never do. Likely mechanism — the old design parked 7 workers on a
+`std::barrier` (which spins before blocking) for ~85% of wall time, burning
+power and ping-ponging one cache line while the GPU ran; the new design sleeps
+them on a condition variable for 97%, leaving turbo headroom and an uncontended
+memory subsystem for the short work burst.
+
+**Cost: the end-of-run tail doubles.** 568 games are now in flight and all are
+discarded partway when the position target is hit — ~29000 positions of wasted
+compute against ~14500 before. Irrelevant on a 2M-position run (1.5%),
+dominant on a 30K one, where it can outweigh the throughput gain entirely.
+Datagen games average ~102 ply (294 games / 30064 positions), so the tail is
+roughly 568 × 51 positions regardless of run length. Fix if short runs matter:
+stop resetting completed games once the target is in reach and let the
+in-flight ones drain.
 
 Correctness measures, since a race here would silently corrupt training data
 rather than crash:
