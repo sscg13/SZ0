@@ -259,18 +259,42 @@ phases the `[io]` timer structurally cannot.
 Two gotchas when reading it:
 
 - **`nps` counts NN evals, not iterations**, so `datagenbatchsize / cycle`
-  overstates it. `select()` backprops terminal leaves (bare king, 70-move,
-  repetition, stalemate) without an NN eval, and a game that has finished its
-  rollouts spends that iteration choosing a move. Mean fill ≈ 266/284 (94%) at
-  300 nodes/move — which fully explains cycle 4400 µs reading as 60K rather
-  than 64.5K. The captured graph runs all 284 rows regardless, so ~6% of `run`
-  is padding; not recoverable without giving up graph capture. The `[dg]` line
-  now reports fill and implied nps directly.
+  overstates it. See batch fill below — the `[dg]` line reports fill and implied
+  nps directly.
 - **Set `SZ0_TIME_IO_EVERY` to a multiple of nodes/move.** The arena clears
   every root move, so tree depth sweeps shallow→deep with period exactly
   `nodecount`, and all games stay in lockstep (one rollout each per iteration).
   Reporting every 1000 at 300 nodes/move aliases that cycle and makes `select`
   swing 60–464 µs between windows. 3000 gives ten whole periods.
+
+### Batch fill decay — the reason datagen nps falls during a run
+
+Measured over one run at 300 nodes/move, 3000-iteration windows:
+
+| | fill | implied nps | cycle |
+|---|---|---|---|
+| early | 284/284 | 64K | 4414 |
+| mid | 266/284 | 58K | 4607 |
+| late | 228/284 | 50K | 4526 |
+
+Fill and nps track exactly (284/228 = 1.25 vs 64/50 = 1.28) while cycle time
+barely moves — **the decay is the batch emptying, not anything getting slower.**
+
+Cause: `select()` finishes a rollout itself when the leaf is terminal (bare
+king, 70-move, repetition, stalemate), returning false, and the batch row was
+left empty. Terminal leaves get commoner as games reach endgames, and shatranj's
+bare-king and 70-move rules make them very common there. The captured graph runs
+all 284 rows whether occupied or not, so by late run ~20% of every inference was
+computing padding.
+
+Fixed by retrying instead of yielding the slot: on a terminal leaf, roll out
+again for that game until a slot is filled or the budget is exhausted (bounded —
+the only false return increments `rollouts_completed`). Expected ~+20% at steady
+state, no extra memory. Search semantics unchanged; RNG interleaving across
+games differs, so data is statistically equivalent but not bit-identical.
+
+**This also invalidates comparing nps readings taken at different points in a
+run** — early readings are optimistic. Compare at equal fill.
 
 ### Arena sizing
 
@@ -281,11 +305,11 @@ children per expansion, with zero overflows. `datagenarenasize` cut to 32768
 children but still backprops, leaving a leaf that is re-selected forever — now
 counted and warned about rather than degrading quality invisibly.
 
-Remaining per batch (300 nodes/move): ~3900 µs GPU phase, ~833 µs tree work,
-serial. Double-buffering (two game pools, alternating batches) would hide the
-tree work: ceiling ~73K nps. The memory cost is what the arena cut just paid
-for. Overlapping the h2d/d2h copies as well needs async streams and a second
-capture — larger change, smaller remaining prize.
+Priority order after all of the above: batch backfill (~20%, done) > double
+buffering (~10%, doubles pool memory — two game pools alternating so tree work
+hides under the next batch's GPU work) > anything left inside the ONNX graph
+(a few %). Overlapping the h2d/d2h copies needs async streams and a second
+capture: larger change, smallest prize of the three.
 
 ## sz0_run4
 

@@ -365,9 +365,17 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         shared_needs_nn[i] = 0;
         DatagenGame &g = *games[i];
 
-        if (g.rollouts_completed < nodecount) {
-          bool needs_nn = select(g, rng);
-          if (needs_nn) {
+        // Retry rather than yielding the slot. select() finishes a rollout by
+        // itself when the leaf is terminal (bare king, 70-move, repetition,
+        // stalemate) — it backprops and returns false, having already counted
+        // the rollout. Leaving the batch row empty in that case wastes a row of
+        // a fixed-shape captured batch, which the GPU runs whether or not it is
+        // occupied. Terminal leaves get commoner as games reach endgames, which
+        // is why fill (and so nps) decays over a run.
+        //
+        // Bounded: the only false return increments rollouts_completed.
+        while (g.rollouts_completed < nodecount) {
+          if (select(g, rng)) {
             shared_needs_nn[i] = 1;
 
             // Lock-free atomic reservation for this board's slot in the batch
@@ -385,6 +393,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
                   13 * p_sq;
             }
             batched_halfmoves[b_idx] = clamp_halfmove(g.leaf_pos.halfmovecount);
+            break; // slot filled; this game is done for the iteration
           }
         }
       }
