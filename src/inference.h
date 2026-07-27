@@ -1,10 +1,12 @@
 #include "position.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <onnxruntime_cxx_api.h>
 #include <vector>
@@ -30,6 +32,37 @@ class NNEvaluator {
   Ort::Env env;
   Ort::Session session{nullptr};
   Ort::MemoryInfo memory_info;
+
+#ifdef USE_CUDA
+  // CUDA-graph capture path. ORT records the kernel sequence on the first Run
+  // and replays it as a single launch afterwards, which removes the ~1.8 us
+  // per-node dispatch cost that dominates small batches (~0.59 ms of a 1.07 ms
+  // batch-32 inference). Capture requires a fixed shape and device-resident
+  // IO at stable addresses, so every Run must use exactly graph_batch_ —
+  // smaller requests are zero-padded up to it.
+  bool cuda_graph_ = false;
+  int graph_batch_ = 0;
+  std::unique_ptr<Ort::MemoryInfo> cuda_info_;
+  std::unique_ptr<Ort::Allocator> cuda_alloc_;
+  std::unique_ptr<Ort::IoBinding> binding_;
+  std::vector<Ort::Value> bound_; // owns the device tensors
+  // Concurrent Run is safe on a plain session but not when every call shares
+  // one set of device buffers. Uncontended in practice (datagen infers on
+  // thread 0 only, search on one inference thread) — this just stops the UCI
+  // `eval` command from corrupting an in-flight search batch.
+  std::mutex graph_mutex_;
+  void *d_board_ = nullptr;
+  void *d_half_ = nullptr;
+  void *d_policy_ = nullptr;
+  void *d_value_ = nullptr;
+
+  // Returns false if anything about capture setup fails; caller then keeps
+  // using the ordinary Run path.
+  bool setup_cuda_graph(int batch);
+  std::vector<NNOutput> infer_bound(const std::vector<int32_t> &flat_pieces,
+                                    const std::vector<int32_t> &flat_halfmoves,
+                                    int real_count);
+#endif
 
   // According to ONNX
   std::vector<const char *> input_names = {"in_0", "in_1"};
@@ -82,6 +115,16 @@ public:
 
       std::vector<const char *> keys = {"device_id", "arena_extend_strategy"};
       std::vector<const char *> values = {"0", "kSameAsRequested"};
+      // SZ0_CUDA_GRAPH=1 opts into graph capture. Off by default: capture
+      // pins the batch shape for the session's lifetime, so it is a behaviour
+      // change, not just a speedup.
+      const char *want_graph = std::getenv("SZ0_CUDA_GRAPH");
+      if (want_graph && want_graph[0] == '1' && fixed_batch > 0) {
+        keys.push_back("enable_cuda_graph");
+        values.push_back("1");
+        cuda_graph_ = true;
+        graph_batch_ = fixed_batch;
+      }
       Ort::GetApi().UpdateCUDAProviderOptions(cuda_options, keys.data(),
                                               values.data(), keys.size());
 
@@ -114,6 +157,14 @@ public:
 #else
     // Linux uses standard char arrays
     session = Ort::Session(env, model_path, session_options);
+#endif
+
+#ifdef USE_CUDA
+    // Must happen before the warmup Run: that Run is what ORT captures.
+    if (cuda_graph_ && !setup_cuda_graph(graph_batch_)) {
+      fprintf(stderr, "CUDA graph setup failed; using the standard Run path\n");
+      cuda_graph_ = false;
+    }
 #endif
 
     // Warm the session with one dummy batch so provider autotuning (cuDNN /

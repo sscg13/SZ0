@@ -52,6 +52,11 @@ ifeq ($(GPU), yes)
     CXXFLAGS += -DUSE_CUDA
     INCLUDES += -I$(CUDNN_DIR)/include
     LDFLAGS  += -L$(CUDNN_DIR)/lib64 -Wl,-rpath,$(ONNX_DIR)/lib -Wl,-rpath,$(CONDA_PREFIX)/lib
+    # cudaMemcpy for the CUDA-graph path (SZ0_CUDA_GRAPH=1), which needs
+    # device-resident IO. CUDA_HOME is set by the cuda module.
+    INCLUDES += -I$(CUDA_HOME)/include
+    LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64
+    LDLIBS   += -lcudart
 endif
 
 ifeq ($(BATCH), yes)

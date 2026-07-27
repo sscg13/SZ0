@@ -134,6 +134,27 @@ Open follow-ups:
 Naive dynamic exports are up to ~10× slower on CUDA (reshape overhead).
 The fix loads the dynamic export and optimizes it for constant batch size at runtime.
 
+## What ORT actually executes (infrastructure)
+
+Set `SZ0_DUMP_OPTIMIZED=<path>` to have the engine write the post-fusion graph,
+then histogram it with `src/nn/inspect_graph.py --raw`. **Only measure this way**
+— the pip `onnxruntime` is a different build (1.27, CPU-only) from the linked
+C++ library (1.24, CUDA), and fusion differs by both provider and version. A
+CPU-provider reading is actively misleading: fp16 Softmax has no CPU kernel, so
+CPU decomposes it into ReduceMax/Sub/Exp/ReduceSum/Div and inserts ~130 Casts,
+none of which happens on CUDA.
+
+Production graph (10 blk, qk64, batch 32, CUDA, ORT 1.24): **326 nodes, 59%
+data movement**. Already fused: `BiasSoftmax` ×10 (spatial bias + softmax),
+`FusedMatMul` ×11 (attention scale folded into the matmul),
+`SkipLayerNormalization` ×20, `QuickGelu` ×10. Offline rewrites for any of
+these are redundant — tried and reverted.
+
+Left on the table: whole-attention fusion never fires (no `MultiHeadAttention`,
+so the scores tensor still round-trips through HBM), 146 Reshape + 40 Transpose
+survive, and there are 326 kernel launches per inference with no CUDA graph
+capture (`enable_cuda_graph` is not set).
+
 ## sz0_run4
 
 Fresh trains from scratch on the accumulated window, not iteratively refined.

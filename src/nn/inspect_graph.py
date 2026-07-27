@@ -59,13 +59,30 @@ MOVEMENT_OPS = {"Reshape", "Transpose", "Squeeze", "Unsqueeze", "Identity",
                 "Concat", "Split", "Slice", "Gather", "Cast"}
 
 
+# Fusions worth knowing about, and what each one collapses.
+KNOWN_FUSIONS = {
+    "Attention": "whole attention block",
+    "MultiHeadAttention": "whole attention block",
+    "BiasSoftmax": "bias add + softmax",
+    "FusedMatMul": "matmul + scalar scale",
+    "SkipLayerNormalization": "residual + layernorm",
+    "QuickGelu": "activation",
+    "FusedGemm": "gemm + activation",
+}
+
+
 def report(hist, label):
     total = sum(hist.values())
     movement = sum(c for op, c in hist.items() if op in MOVEMENT_OPS)
-    fused = [op for op in hist if "Attention" in op]
     print(f"{label}: {total} nodes, {movement} data-movement "
           f"({100 * movement / total:.0f}%)")
-    print(f"  attention fused: {', '.join(fused) if fused else 'NO'}")
+    for op, what in KNOWN_FUSIONS.items():
+        if hist.get(op):
+            print(f"  fused: {op} x{hist[op]} ({what})")
+    whole = any(hist.get(op) for op in ("Attention", "MultiHeadAttention"))
+    if not whole:
+        print("  NOT fused: whole attention block — scores tensor is "
+              "materialised in HBM")
 
 
 def main():
