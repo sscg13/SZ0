@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <mutex>
 #include <onnxruntime_cxx_api.h>
@@ -55,6 +57,23 @@ public:
           session_options, "batch", fixed_batch));
     }
     // session_options.EnableProfiling("shatranj_profile.json");
+
+    // Set SZ0_DUMP_OPTIMIZED=<path> to write the graph ORT actually executes,
+    // after provider partitioning and fusion. This is the only faithful way to
+    // see it: the pip onnxruntime is a different build (and usually CPU-only)
+    // than the CUDA-enabled library linked here, and fusion differs by both
+    // provider and version. Inspect the result with src/nn/inspect_graph.py
+    // --raw, which only reads the file.
+    if (const char *dump_path = std::getenv("SZ0_DUMP_OPTIMIZED")) {
+#ifdef _WIN32
+      std::string dump_str(dump_path);
+      std::wstring dump_wide(dump_str.begin(), dump_str.end());
+      session_options.SetOptimizedModelFilePath(dump_wide.c_str());
+#else
+      session_options.SetOptimizedModelFilePath(dump_path);
+#endif
+      printf("Dumping ORT-optimized graph to %s\n", dump_path);
+    }
 
 #ifdef USE_CUDA
     try {

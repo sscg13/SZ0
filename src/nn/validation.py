@@ -42,6 +42,14 @@ from dataloader import SparseInMemoryDataLoader, load_sparse_dataset
 from train import compute_loss
 
 
+def parse_d_ff(text):
+    """'256' -> 256; '384,384,320,...' -> tuple of per-layer widths."""
+    if text is None:
+        return None
+    parts = [p for p in text.replace(" ", "").split(",") if p]
+    return int(parts[0]) if len(parts) == 1 else tuple(int(p) for p in parts)
+
+
 def summarise(name, values):
     """Mean and 95% CI of the mean, over per-batch losses."""
     n = len(values)
@@ -87,10 +95,12 @@ def load_net(run_dir, blocks, step, d_ff=None, d_qk_head=None):
     state = manager.restore(
         step, args=ocp.args.Composite(state=ocp.args.StandardRestore(state))
     )["state"]
+    ff = (model.d_ff if isinstance(model.d_ff, int)
+          else ",".join(str(w) for w in model.d_ff))
     qk = model.d_qk_head if model.d_qk_head is not None else (
         model.d_model // model.num_heads)
     label = (f"{run_dir} step {step} | {model.num_layers} blocks, "
-             f"d_ff {model.d_ff}, d_qk_head {qk} | {nparams:,} params")
+             f"d_ff {ff}, d_qk_head {qk} | {nparams:,} params")
     return state, label
 
 
@@ -103,8 +113,9 @@ def main():
     ap.add_argument("--blocks", type=int, default=None,
                     help="num_layers of the checkpoint (default: "
                          "architecture.py's current default)")
-    ap.add_argument("--d-ff", type=int, default=None,
-                    help="d_ff of the checkpoint (default: architecture.py's "
+    ap.add_argument("--d-ff", default=None,
+                    help="d_ff of the checkpoint: one int, or a comma-"
+                         "separated per-layer list (default: architecture.py's "
                          "current default)")
     ap.add_argument("--d-qk-head", type=int, default=None,
                     help="QK head dim of the checkpoint (default: "
@@ -116,7 +127,7 @@ def main():
                          "separate runs' means")
     ap.add_argument("--vs-step", type=int, default=None)
     ap.add_argument("--vs-blocks", type=int, default=None)
-    ap.add_argument("--vs-d-ff", type=int, default=None)
+    ap.add_argument("--vs-d-ff", default=None)
     ap.add_argument("--vs-d-qk-head", type=int, default=None)
     ap.add_argument("--batches", type=int, default=1000,
                     help="batches of 284 to average over (default 1000)")
@@ -126,7 +137,7 @@ def main():
     args = ap.parse_args()
 
     state_a, label_a = load_net(args.run_dir, args.blocks, args.step,
-                                args.d_ff, args.d_qk_head)
+                                parse_d_ff(args.d_ff), args.d_qk_head)
     print(label_a)
     eval_a = jax.jit(
         lambda params, batch: compute_loss(params, state_a.apply_fn, batch)
@@ -135,7 +146,7 @@ def main():
     state_b = eval_b = None
     if args.vs is not None:
         state_b, label_b = load_net(args.vs, args.vs_blocks, args.vs_step,
-                                    args.vs_d_ff, args.vs_d_qk_head)
+                                    parse_d_ff(args.vs_d_ff), args.vs_d_qk_head)
         print(f"  vs  {label_b}")
         eval_b = jax.jit(
             lambda params, batch: compute_loss(params, state_b.apply_fn, batch)

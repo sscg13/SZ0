@@ -148,8 +148,8 @@ Open follow-ups:
   run4 to make more headway on this
 - increase data window and/or train longer (confounded — see below)
 - reserve a small slice of datagen for representative validation
-- `qk 64` — QK is by far the most Elo-dense axis per unit throughput (below);
-  prefer 64 over 48 so the effect can clear the ±17 match resolution
+- datagen throughput budget — now 47K vs 95K originally; decide explicitly
+  rather than letting adoptions erode it further
 - MoE: not optimistic (Leela failed; MoE adds params + traffic, the wrong
   trade for a memory-bound, data-limited net). Head specialization IS proven —
   NNUE output buckets are hard-routed head-MoE (hand-selected by piece count).
@@ -232,6 +232,18 @@ games. Loss is a usable screen between identically-trained fresh nets.
 
 `d_ff 512` may partly compensate for lost QK capacity, but not enough it seems. 
 
+### qk 32 → 64 — adopted
+
+400 games, paired, 6s+0.1, vs `d_ff256 + qk32`: +20.9 ± 17.7 pentanomial
+(+20.9 ± 23.8 trinomial), LOS 99.0%, pairs `[0, 43, 90, 67, 0]`. Paired loss
+−0.0079 ± 0.0017. TC understates quality since qk64 is slower (~+27 Elo if
+search loses ~12% nps). Datagen 59K → 47K (−20%).
+
+Well into diminishing returns, but still marginally more elo / datagen cost 
+compared to going from 6 blocks to 10 blocks.
+
+Loss underestimated the change. −0.0079 is 1.2× the noise floor ("ambiguous") yet
+the match was significant. Probably nat to elo is not always constant per change.
 Datagen cost, now decomposable:
 
 | Config | nps | vs baseline |
@@ -243,8 +255,6 @@ Datagen cost, now decomposable:
 
 Fitting `T = c + b·d_qk_head`, QK is only ~13% of datagen time at qk32;
 extrapolating up gives qk48 ≈ 55.5K, qk64 ≈ 52K.
-
-QK appears far more throughput-efficient than depth, so it is the next thing to test
 
 ### GPU utilisation: memory bound, not compute bound
 

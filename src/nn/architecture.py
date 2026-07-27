@@ -1,6 +1,47 @@
+import math
+from typing import Sequence, Union
+
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+
+
+def cosine_ff_schedule(num_layers, d_ff=256, start_ratio=1.5, end_ratio=0.5,
+                       multiple=64):
+    """Per-layer FFN widths tapering wide -> narrow (arXiv:2606.23670).
+
+    Capacity concentrates in the early layers. Widths are rounded to
+    `multiple`, then corrected so the total equals `num_layers * d_ff` — the
+    schedule is parameter-, FLOP- and traffic-neutral against a uniform net.
+
+    >>> cosine_ff_schedule(10, 256)
+    (384, 384, 384, 320, 256, 256, 192, 128, 128, 128)
+    """
+    if num_layers < 2:
+        return (d_ff,) * num_layers
+
+    start, end = start_ratio * d_ff, end_ratio * d_ff
+    exact = [end + (start - end) / 2 * (1 + math.cos(math.pi * l / (num_layers - 1)))
+             for l in range(num_layers)]
+    widths = [max(multiple, round(e / multiple) * multiple) for e in exact]
+
+    # Nudge one `multiple` at a time, at whichever layer it least distorts the
+    # curve, until the parameter budget matches. Unreachable when
+    # num_layers * d_ff is not itself a multiple; bounded so it cannot spin.
+    target = num_layers * d_ff
+    for _ in range(4 * num_layers):
+        if sum(widths) == target:
+            break
+        step = multiple if sum(widths) < target else -multiple
+        candidates = [i for i in range(num_layers) if widths[i] + step >= multiple]
+        if not candidates:
+            break
+        best = min(candidates,
+                   key=lambda i: abs(widths[i] + step - exact[i])
+                   - abs(widths[i] - exact[i]))
+        widths[best] += step
+    return tuple(widths)
+
 
 # --- 1. Model Definitions (The Blueprint) ---
 
@@ -10,7 +51,7 @@ class Attention(nn.Module):
     # QK and V head dims, decoupled from each other and from d_model.
     # None => d_model // num_heads (unchanged). Decoupling V matters when
     # changing num_heads, which would otherwise silently rescale it.
-    d_qk_head: int = None
+    d_qk_head: int = 64
     d_v_head: int = None
 
     @nn.compact
@@ -64,7 +105,7 @@ class ShatranjBlock(nn.Module):
     d_model: int = 256
     num_heads: int = 8
     d_ff: int = 256
-    d_qk_head: int = None
+    d_qk_head: int = 64
     d_v_head: int = None
 
     @nn.compact
@@ -77,8 +118,10 @@ class ShatranjNet(nn.Module):
     num_layers: int = 10
     d_model: int = 256
     num_heads: int = 8
-    d_ff: int = 256
-    d_qk_head: int = None
+    # int = uniform width; tuple of length num_layers = per-layer widths
+    # (see cosine_ff_schedule). Must be a tuple, not a list — Flax hashes it.
+    d_ff: Union[int, Sequence[int]] = 256
+    d_qk_head: int = 64
     d_v_head: int = None
     vocab_size: int = 13 * 64
     max_halfmoves: int = 140
@@ -96,8 +139,13 @@ class ShatranjNet(nn.Module):
         x = x + jnp.expand_dims(g_emb, axis=-2) 
 
         # Transformer Body
-        for _ in range(self.num_layers):
-            x = ShatranjBlock(self.d_model, self.num_heads, self.d_ff,
+        widths = ((self.d_ff,) * self.num_layers
+                  if isinstance(self.d_ff, int) else tuple(self.d_ff))
+        if len(widths) != self.num_layers:
+            raise ValueError(f"d_ff has {len(widths)} entries, "
+                             f"num_layers is {self.num_layers}")
+        for width in widths:
+            x = ShatranjBlock(self.d_model, self.num_heads, width,
                               self.d_qk_head, self.d_v_head)(x)
             
         x = nn.LayerNorm()(x)
