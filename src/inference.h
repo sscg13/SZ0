@@ -74,8 +74,19 @@ public:
   // optimizes the graph as fully static — fusions, memory planning, and CUDA
   // graph capture behave as with a fixed-batch export. Models with
   // hard-coded batch dims are unaffected (the override matches nothing).
+  // SZ0_ORT_VERBOSE=1 makes ORT log its node placements, i.e. which nodes it
+  // assigned to which execution provider. That is the only way to find out
+  // why CUDA graph capture is refused: capture requires every node on the
+  // CUDA EP, and a single unsupported op (or one that requires a CPU input)
+  // silently drags a subgraph back to the CPU provider.
+  static OrtLoggingLevel log_level() {
+    const char *v = std::getenv("SZ0_ORT_VERBOSE");
+    return (v && v[0] == '1') ? ORT_LOGGING_LEVEL_VERBOSE
+                              : ORT_LOGGING_LEVEL_WARNING;
+  }
+
   NNEvaluator(const char *model_path, int fixed_batch = 0)
-      : env(ORT_LOGGING_LEVEL_WARNING, "ShatranjZer0"),
+      : env(log_level(), "ShatranjZer0"),
         memory_info(
             Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {
     Ort::SessionOptions session_options;
