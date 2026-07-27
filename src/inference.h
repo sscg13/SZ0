@@ -29,6 +29,11 @@ struct MCTSEval {
 MCTSEval parse_nn_output(const NNOutput &raw_nn, const Move *moves,
                          int movecount, bool stm);
 
+// Same, reading a row straight out of a batch buffer instead of a copied-out
+// NNOutput. `policy` points at 4096 floats, `value` at 3.
+MCTSEval parse_nn_output(const float *policy, const float *value,
+                         const Move *moves, int movecount, bool stm);
+
 // The halfmove embedding has max_halfmoves = 140 rows (valid 0..139), but the
 // seventy-move rule lets halfmovecount reach 140. The model used to clamp this
 // internally with a Clip node; int32 Clip has no CUDA kernel, so ORT placed it
@@ -99,6 +104,14 @@ class NNEvaluator {
   // According to ONNX
   std::vector<const char *> input_names = {"in_0", "in_1"};
   std::vector<const char *> output_names = {"policy", "value"};
+
+  // Where the last infer_packed left its results. With CUDA graph capture on
+  // these point at the pinned landing buffers; otherwise they point into
+  // last_outputs_, which is held precisely so ORT's device-to-host staging
+  // survives the call and needs no copy of our own.
+  const float *last_policy_ = nullptr;
+  const float *last_value_ = nullptr;
+  std::vector<Ort::Value> last_outputs_;
 
 public:
   // fixed_batch > 0 pins a symbolic batch dimension named "batch" (if the
@@ -227,10 +240,23 @@ public:
 #endif
 
   NNOutput infer(const Position &pos);
+  // Runs a full datagenbatchsize batch and leaves the results addressable via
+  // batch_policy() / batch_value(). Deliberately does NOT scatter them into
+  // per-game structs: that is ~280 independent row copies, and doing it here
+  // would run them on the single thread that owns inference while every worker
+  // waits at a barrier. Callers consume the rows from their own parallel phase
+  // instead.
   void infer_packed(const std::vector<int32_t> &flat_pieces,
-                    const std::vector<int32_t> &flat_halfmoves,
-                    std::vector<NNOutput> &shared_results,
-                    const std::vector<int> &batch_to_game_idx);
+                    const std::vector<int32_t> &flat_halfmoves);
+
+  // Row b of the last infer_packed batch: 4096 policy floats at
+  // batch_policy() + b*4096, 3 value floats at batch_value() + b*3.
+  //
+  // Valid only until the next inference call on this evaluator, which
+  // overwrites the buffers in place. Safe to read concurrently from many
+  // threads in between; not safe to overlap with another inference.
+  const float *batch_policy() const { return last_policy_; }
+  const float *batch_value() const { return last_value_; }
   std::vector<NNOutput>
   infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
                       const std::vector<int32_t> &flat_halfmoves,

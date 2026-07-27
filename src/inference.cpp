@@ -10,15 +10,19 @@
 
 MCTSEval parse_nn_output(const NNOutput &raw_nn, const Move *moves,
                          int movecount, bool stm) {
+  return parse_nn_output(raw_nn.policy, raw_nn.value, moves, movecount, stm);
+}
+
+MCTSEval parse_nn_output(const float *policy, const float *value,
+                         const Move *moves, int movecount, bool stm) {
   MCTSEval result;
   result.priors.resize(movecount);
 
   // Numerically stable softmax
-  float max_v_logit =
-      std::max({raw_nn.value[0], raw_nn.value[1], raw_nn.value[2]});
-  float exp_w = std::exp(raw_nn.value[0] - max_v_logit);
-  float exp_d = std::exp(raw_nn.value[1] - max_v_logit);
-  float exp_l = std::exp(raw_nn.value[2] - max_v_logit);
+  float max_v_logit = std::max({value[0], value[1], value[2]});
+  float exp_w = std::exp(value[0] - max_v_logit);
+  float exp_d = std::exp(value[1] - max_v_logit);
+  float exp_l = std::exp(value[2] - max_v_logit);
   float sum_v = exp_w + exp_d + exp_l;
 
   float prob_win = exp_w / sum_v;
@@ -38,7 +42,7 @@ MCTSEval parse_nn_output(const NNOutput &raw_nn, const Move *moves,
     int to_sq = moves[i].to() ^ (stm ? 56 : 0);
 
     int index = from_sq * 64 + to_sq;
-    float logit = raw_nn.policy[index];
+    float logit = policy[index];
 
     move_logits[i] = logit;
     if (logit > max_logit) {
@@ -191,10 +195,10 @@ struct IoTimer {
   bool on = false;
   long long report_every = 1000;
   long long calls = 0;
-  // Phases, in execution order. Exactly one of copy_out / scatter is charged
-  // per call: copy_out by the search path, which must build a vector, and
-  // scatter by datagen, which writes straight into shared_results.
-  double h2d = 0, run = 0, d2h = 0, copy_out = 0, scatter = 0;
+  // Phases, in execution order. `copy_out` is charged only by the search path,
+  // which owes its caller a vector of NNOutput; datagen has no marshalling
+  // left here at all, having moved it into its own parallel expand phase.
+  double h2d = 0, run = 0, d2h = 0, copy_out = 0;
 
   IoTimer() {
     const char *v = std::getenv("SZ0_TIME_IO");
@@ -210,15 +214,15 @@ struct IoTimer {
     if (++calls < report_every)
       return;
     double n = static_cast<double>(calls);
-    double host = h2d + d2h + copy_out + scatter;
+    double host = h2d + d2h + copy_out;
     double total = host + run;
     fprintf(stderr,
             "[io] batch %d n=%lld | h2d %.0f  run %.0f  d2h %.0f  copy %.0f  "
-            "scatter %.0f  | total %.0f us, host-side %.1f%%\n",
-            batch, calls, h2d / n, run / n, d2h / n, copy_out / n, scatter / n,
-            total / n, 100.0 * host / total);
+            "| total %.0f us, host-side %.1f%%\n",
+            batch, calls, h2d / n, run / n, d2h / n, copy_out / n, total / n,
+            100.0 * host / total);
     calls = 0;
-    h2d = run = d2h = copy_out = scatter = 0;
+    h2d = run = d2h = copy_out = 0;
   }
 };
 
@@ -323,28 +327,15 @@ NNEvaluator::infer_dynamic_batch(const std::vector<int32_t> &flat_pieces,
 }
 
 void NNEvaluator::infer_packed(const std::vector<int32_t> &flat_pieces,
-                               const std::vector<int32_t> &flat_halfmoves,
-                               std::vector<NNOutput> &shared_results,
-                               const std::vector<int> &batch_to_game_idx) {
+                               const std::vector<int32_t> &flat_halfmoves) {
 #ifdef USE_CUDA
   if (cuda_graph_ && graph_batch_ == datagenbatchsize) {
-    // Scatter straight out of the pinned landing buffer, matching what the
-    // ordinary Run path below does with the ORT output tensor. The lock must
-    // cover the reads, not just the Run: the buffers are shared across calls.
     std::lock_guard<std::mutex> lock(graph_mutex_);
     run_bound_locked(flat_pieces, flat_halfmoves, datagenbatchsize);
-    clk::time_point t{};
+    last_policy_ = h_policy_;
+    last_value_ = h_value_;
     if (io_timer.on)
-      t = clk::now();
-    for (int b = 0; b < datagenbatchsize; ++b) {
-      NNOutput &dst = shared_results[batch_to_game_idx[b]];
-      std::copy(h_policy_ + b * 4096, h_policy_ + (b + 1) * 4096, dst.policy);
-      std::copy(h_value_ + b * 3, h_value_ + (b + 1) * 3, dst.value);
-    }
-    if (io_timer.on) {
-      io_timer.scatter += us_since(&t);
       io_timer.tick(datagenbatchsize);
-    }
     return;
   }
 #endif
@@ -364,22 +355,13 @@ void NNEvaluator::infer_packed(const std::vector<int32_t> &flat_pieces,
   input_tensors.push_back(std::move(board_tensor));
   input_tensors.push_back(std::move(halfmove_tensor));
 
-  auto output_tensors = session.Run(
+  // Held in a member rather than a local: the caller reads the rows straight
+  // out of these tensors, so they have to outlive the call.
+  last_outputs_ = session.Run(
       Ort::RunOptions{nullptr}, input_names.data(), input_tensors.data(),
       input_tensors.size(), output_names.data(), output_names.size());
-
-  // Slice Outputs
-  std::vector<NNOutput> results(datagenbatchsize);
-  float *policy_ptr = output_tensors[0].GetTensorMutableData<float>();
-  float *value_ptr = output_tensors[1].GetTensorMutableData<float>();
-
-  for (int b = 0; b < datagenbatchsize; ++b) {
-    int target_game = batch_to_game_idx[b];
-    std::copy(policy_ptr + (b * 4096), policy_ptr + ((b + 1) * 4096),
-              shared_results[target_game].policy);
-    std::copy(value_ptr + (b * 3), value_ptr + ((b + 1) * 3),
-              shared_results[target_game].value);
-  }
+  last_policy_ = last_outputs_[0].GetTensorData<float>();
+  last_value_ = last_outputs_[1].GetTensorData<float>();
 }
 
 std::future<NNOutput> BatchEvaluator::submit(const Position &pos) {

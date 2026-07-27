@@ -200,14 +200,43 @@ zero-fills of buffers that are overwritten immediately, and a copy into a
 temporary that exists only to be scattered out of.
 
 Fix: one persistent pinned landing buffer allocated at setup, each caller
-scattering directly out of it. Removes all three, and pinning should roughly
-halve the transfer. Host-side ~1350 → ~450 µs, i.e. ~15% of the full 6040 µs
-datagen batch cycle (the ~1140 µs this timer does not see is tree work).
+scattering directly out of it.
 
-Also measured `run` = 1684 MB / 3550 µs = **474 GB/s, 55% of the L40S's 864** —
-higher than the 41% below, which was computed against the whole batch cycle
-rather than the GPU phase. Memory bound is confirmed more strongly than that
-number suggested, and it caps `run` headroom at ~1.8×.
+### Result: datagen 47K → 62K nps (+32%)
+
+| Phase | before | after |
+|---|---|---|
+| `run` | 3550 | 3670 |
+| `d2h` | 370 | 190 |
+| `copy` | 350 | 0 |
+| `scatter` | 240 | 230 |
+| `results` + `stage` | 372 | 0 |
+| host-side share | 27.5% | 10.7% |
+
+Pinning delivered exactly as predicted (12.6 → 24.5 GB/s). The overall win did
+not: predicted +15%, got +32%.
+
+**The instrumentation timed allocation but not deallocation**, and the gap is
+the difference. Measured total fell 4900 → 4115 µs (−785), but the full batch
+cycle fell 6043 → 4581 µs (−1462). The missing 677 µs is destruction of the
+three multi-MB vectors, which happened after the last timestamp: at those sizes
+glibc uses `mmap`/`munmap`, so every batch returned pages to the kernel and
+re-faulted them on the next allocation. Zero-fill was the visible half of that
+cost; free plus page faults was the rest. Lesson: instrument the whole cycle,
+not just the phases you suspect.
+
+`run` rose 3.4% and drifts upward within a run (3596 → 3685) — same graph, same
+batch, so most likely clock throttle from sustaining 32% more work. Unconfirmed.
+
+`run` = 1684 MB / 3670 µs = **459 GB/s, 53% of the L40S's 864** — well above the
+41% below, which was computed against the whole batch cycle rather than the GPU
+phase. Memory bound is confirmed more strongly than that number suggested, and
+it caps `run` headroom at ~1.9×.
+
+Remaining per batch: 3670 GPU, ~440 host marshalling, ~466 tree work, all
+serial. Double-buffering to overlap the latter two with the next batch's GPU
+work has a ceiling of ~77K nps — now by far the largest single lever, and much
+bigger than anything left inside the graph.
 
 ## sz0_run4
 
@@ -216,6 +245,12 @@ Fresh trains from scratch on the accumulated window, not iteratively refined.
 ≈ 4 epochs; ~10 h at 6 blocks, ~13.5 h at 10. `baseline` is the 6-block fresh
 train.
 
+**nps caveat:** every datagen figure below (95K, 63K, 59K, 55K, 47K) predates
+the inference-path fixes and carries ~28% host-side overhead. They are
+comparable to each other but *not* to anything measured after — the same qk64
+net that read 47K reads 62K now. Architecture cost ratios between them still
+hold; absolute numbers do not.
+
 Open follow-ups:
 
 - figure out how to close the ~67 Elo data/iterative gap (below) — 10× the
@@ -223,8 +258,11 @@ Open follow-ups:
   run4 to make more headway on this
 - increase data window and/or train longer (confounded — see below)
 - reserve a small slice of datagen for representative validation
-- datagen throughput budget — now 47K vs 95K originally; decide explicitly
-  rather than letting adoptions erode it further
+- datagen throughput budget — now 62K vs 95K originally (was 47K before the
+  inference-path fixes); decide explicitly rather than letting adoptions erode
+  it further
+- double-buffer datagen: overlap host marshalling + tree work with the next
+  batch's GPU work, ceiling ~77K nps — biggest remaining lever by far
 - MoE: not optimistic (Leela failed; MoE adds params + traffic, the wrong
   trade for a memory-bound, data-limited net). Head specialization IS proven —
   NNUE output buckets are hard-routed head-MoE (hand-selected by piece count).
@@ -236,8 +274,8 @@ Open follow-ups:
   large reallocation to detect
 - widen `d_model` — raises intensity but also traffic, 
   will be pretty costly for datagen, unless nodes can decrease
-- double-buffer datagen so host marshalling overlaps the next batch's GPU work
-  (the remaining ~450 µs/batch is serial with `run` today)
+- confirm whether the 3.4% `run` rise is GPU clock throttle (`nvidia-smi -q -d
+  CLOCK` during datagen)
 
 ### The baseline anchor is ~67 Elo below the iterative net
 

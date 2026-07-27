@@ -191,18 +191,25 @@ bool select(DatagenGame &game, std::mt19937 &rng) {
   return true;
 }
 
-void expand(DatagenGame &game, const NNOutput &raw_nn) {
+void expand(DatagenGame &game, const float *policy, const float *value_logits,
+            U64 &arena_overflows) {
   U32 current_idx = game.search_path.back();
 
   Move moves[maxmoves];
   int movecount = game.leaf_pos.generatemoves(moves);
 
   MCTSEval processed =
-      parse_nn_output(raw_nn, moves, movecount, game.leaf_pos.stm);
+      parse_nn_output(policy, value_logits, moves, movecount, game.leaf_pos.stm);
   float value = processed.qscore;
 
   U32 child_start = game.arena.active_nodes.load(std::memory_order_relaxed);
 
+  if (child_start + movecount >= game.arena.max_nodes) {
+    // Silent truncation: the rollout still backprops, but the leaf keeps zero
+    // children and will be re-selected forever. Counted so a too-small
+    // datagenarenasize shows up as a number instead of as quiet quality loss.
+    ++arena_overflows;
+  }
   if (child_start + movecount < game.arena.max_nodes) {
     game.arena.active_nodes.fetch_add(movecount, std::memory_order_relaxed);
 
@@ -252,7 +259,11 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   std::atomic<bool> keep_running{true};
 
   std::vector<U8> shared_needs_nn(datagenbatchsize, 0);
-  std::vector<NNOutput> shared_nn_results(datagenbatchsize);
+
+  // Peak arena occupancy across every game and every root move, and the number
+  // of times a leaf could not be expanded because the arena was full.
+  std::atomic<size_t> peak_arena_nodes{0};
+  std::atomic<U64> total_arena_overflows{0};
 
   // Pre-allocated flat arrays for the GPU batch
   std::vector<int32_t> batched_pieces(datagenbatchsize * 64);
@@ -261,6 +272,9 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   // Maps the dense GPU batch index (0 to current_batch_size) back to the global
   // game index (0 to datagenbatchsize)
   std::vector<int> batch_to_game_idx(datagenbatchsize);
+  // Inverse: which batch row a game's leaf landed in, so the parallel expand
+  // phase can find its own row in the evaluator's output buffer.
+  std::vector<int> game_to_batch_idx(datagenbatchsize, -1);
   std::atomic<int> current_batch_size{0};
 
   std::barrier sync_point(datagenthreads);
@@ -273,6 +287,11 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
 
     std::mt19937 rng(std::random_device{}() + thread_idx);
     std::uniform_real_distribution<float> prob_dist(0.0f, 1.0f);
+
+    // Accumulated per thread and merged once at the end, so the hot loop never
+    // touches a shared atomic.
+    size_t local_peak_arena = 0;
+    U64 local_overflows = 0;
 
     for (int i = start_idx; i < end_idx; ++i) {
       games[i]->reset(rng);
@@ -296,6 +315,7 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
             int b_idx =
                 current_batch_size.fetch_add(1, std::memory_order_relaxed);
             batch_to_game_idx[b_idx] = i;
+            game_to_batch_idx[i] = b_idx;
 
             // Thread computes perspective flips directly into the shared GPU
             // buffer
@@ -324,9 +344,11 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         total_nodes_evaluated += batch_size;
 
         if (batch_size > 0) {
-          // Hand the pre-packed flat arrays directly to ONNX
-          nn.infer_packed(batched_pieces, batched_halfmoves, shared_nn_results,
-                          batch_to_game_idx);
+          // Hand the pre-packed flat arrays directly to ONNX. The results are
+          // left in the evaluator's own buffers; the expand phase below reads
+          // them in parallel instead of having this thread scatter them while
+          // every other worker waits at the barrier.
+          nn.infer_packed(batched_pieces, batched_halfmoves);
         }
 
         // Reset the atomic batch size for the next MCTS loop
@@ -359,11 +381,16 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
       // ==========================================
       // Expand & Move Check (Parallelized)
       // ==========================================
+      const float *batch_policy = nn.batch_policy();
+      const float *batch_value = nn.batch_value();
+
       for (int i = start_idx; i < end_idx; ++i) {
         DatagenGame &g = *games[i];
 
         if (shared_needs_nn[i] && g.rollouts_completed < nodecount) {
-          expand(g, shared_nn_results[i]);
+          int b = game_to_batch_idx[i];
+          expand(g, batch_policy + static_cast<size_t>(b) * 4096,
+                 batch_value + static_cast<size_t>(b) * 3, local_overflows);
         }
 
         if (g.rollouts_completed >= nodecount) {
@@ -499,6 +526,11 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
           if (g.root_pos.halfmovecount == 0 && !is_terminal) {
             g.game_hashes.clear();
           }
+          // Sampled here because the arena is cleared once per root move, so
+          // this is its high-water mark for one search of `nodecount` rollouts.
+          local_peak_arena =
+              std::max(local_peak_arena,
+                       g.arena.active_nodes.load(std::memory_order_relaxed));
           g.arena.clear();
           g.rollouts_completed = 0;
         }
@@ -509,6 +541,15 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
         break;
       }
       sync_point.arrive_and_wait();
+    }
+
+    // Every exit above breaks out of the loop, so one merge here covers all of
+    // them. No fetch_max before C++26, hence the CAS.
+    total_arena_overflows.fetch_add(local_overflows, std::memory_order_relaxed);
+    size_t seen = peak_arena_nodes.load(std::memory_order_relaxed);
+    while (local_peak_arena > seen &&
+           !peak_arena_nodes.compare_exchange_weak(seen, local_peak_arena,
+                                                   std::memory_order_relaxed)) {
     }
   };
 
@@ -521,5 +562,17 @@ void generate_batched_selfplay_games(NNEvaluator &nn,
   // --- Wait for the entire datagen run to finish ---
   for (auto &t : threads) {
     t.join();
+  }
+
+  size_t peak = peak_arena_nodes.load(std::memory_order_relaxed);
+  U64 overflows = total_arena_overflows.load(std::memory_order_relaxed);
+  std::cout << "\nPeak arena occupancy: " << peak << " / " << datagenarenasize
+            << " nodes (" << (100.0 * peak / datagenarenasize) << "%, "
+            << (peak * sizeof(Node) / 1024) << " KB of "
+            << (datagenarenasize * sizeof(Node) / 1024) << " KB per game)\n";
+  if (overflows > 0) {
+    std::cout << "WARNING: " << overflows
+              << " leaf expansions were dropped because the arena was full — "
+                 "raise datagenarenasize in src/consts.h\n";
   }
 }
