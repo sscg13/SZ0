@@ -561,6 +561,41 @@ projection and dot product breaks the argument, which is why it is not general
 MHA folklore. Left in place: removing it would break `StandardRestore` for every
 existing checkpoint, for 0.09% of parameters. Revisit at run4 start.
 
+### Dynamic attention bias (scaled-down Smolgen) — implemented, untested
+
+Content-dependent 64×64 map added to the logits alongside the static
+`spatial_bias`, so attention can react to the position rather than only to
+geometry ([Leela](https://lczero.org/blog/2024/02/transformer-progress/)).
+Shared across heads within a layer; **not** shared across layers — Leela shares
+its decoder globally only because a per-head full decode would be ~84M
+parameters over all (layer, head) pairs, which low rank or head-sharing avoids.
+
+`architecture.py`: `dyn_bias_code` (0 = off, the default), `dyn_bias_rank`
+(0 = full 64×64 decode, r > 0 = rank-r `U Vᵀ`), `dyn_bias_compress`.
+
+| variant | params | vs base | FLOPs | traffic | pos/param |
+|---|---|---|---|---|---|
+| off | 5.92M | — | — | — | 21 |
+| rank 4, code 64 | 6.60M | +11.5% | +0.6% | +1.4% | 19 |
+| rank 8, code 64 | 6.94M | +17.2% | +0.8% | +1.4% | 18 |
+| full, code 64 | 8.93M | +50.9% | +1.2% | +1.4% | 14 |
+| full, code 256 (Leela's) | 17.79M | +200% | — | — | 7 |
+
+Throughput is ~1% for every variant — **the cost is parameters**, which is the
+awkward axis given the data-limited diagnosis. Run rank 4 first.
+
+Verified: parameter counts, exact no-op at init (final decode zero-initialised),
+content-dependence (map varies 0.97 across boards in one batch after 30 steps,
+via a `sow` hook readable with `capture_intermediates=True`), gradients reaching
+every stage, and `to_onnx` + `make_dynamic` handling the new ops and reshapes
+(zero unpatched batch reshapes vs baseline). **Not verified: `optimize_model` +
+fp16**, which needs torch — export a random net on the server before training.
+
+Gotcha worth keeping: the zero-init decode blocks gradient to the whole front
+end (compress/code/norm/u) at step 0, since a zero kernel has zero Jacobian. It
+unfreezes at step 1 (front-end ‖grad‖ 0 → 5e-3). Zeroing *both* rank factors
+would trap them permanently — only `V` is zeroed.
+
 ### Kimi Attention Residuals — assessed, not run
 
 `h_l = Σ_{i<l} α_{i→l} v_i`, attention over depth with a learned per-layer

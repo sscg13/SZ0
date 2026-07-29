@@ -111,7 +111,12 @@ class Attention(nn.Module):
             # from step 1.
             v = dense(seq * r, name="dyn_v",
                       kernel_init=nn.initializers.zeros)(c).reshape((b, seq, r))
-            m = jnp.einsum("bir,bjr->bij", u, v)
+            # matmul rather than einsum. einsum exports fine, but ORT's
+            # optimizer handles a plain MatMul better — it is what the fusion
+            # patterns (FusedMatMul and friends) match on, and it is the same
+            # (b,s,r) x (b,r,s) shape the policy head already uses. Do not
+            # "simplify" this back to einsum.
+            m = jnp.matmul(u, jnp.swapaxes(v, -1, -2))
         else:
             m = dense(seq * seq, name="dyn_decode",
                       kernel_init=nn.initializers.zeros)(c).reshape(
