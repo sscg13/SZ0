@@ -500,6 +500,102 @@ Datagen cost, now decomposable:
 Fitting `T = c + b·d_qk_head`, QK is only ~13% of datagen time at qk32;
 extrapolating up gives qk48 ≈ 55.5K, qk64 ≈ 52K.
 
+### Cosine FFN taper — no signal, costs throughput, rejected
+
+Per-layer `d_ff` tapered wide→narrow (arXiv:2606.23670), `(384, 384, 384, 320,
+256, 256, 192, 128, 128, 128)`, summing to 10×256 so parameters and FLOPs match
+uniform `d_ff=256` exactly.
+
+400 games paired, 6s+0.1, vs `d_ff256 + qk64`: **+6.9 ± 15.8 pentanomial**
+(+6.9 ± 22.1 trinomial), LOS 80.6%, pairs `[0, 39, 114, 47, 0]`. Inside the
+~10 Elo floor and the interval includes zero. **Zero WW and zero LL pairs in
+200** — no opening either net could win from both sides, i.e. the two nets play
+nearly identical chess.
+
+Paired validation agrees: **Total +0.0002 ± 0.0018** — 0.03× the noise floor,
+the flattest null the method can produce. Datagen **70K → 67K (−4.3%)**.
+Reverted to uniform `d_ff=256`; `cosine_ff_schedule` kept for future reshaping.
+
+**Third calibration point for loss screening, and the cleanest one.** Loss and
+match now agree at all three: qk16 loss +0.0149 (2.3× floor) / match −37.5,
+both clearly bad; qk64 loss −0.0079 (1.2× floor) / match +20.9, loss
+understated; cosine taper loss +0.0002 / match +6.9 ± 15.8, both null. Loss has
+not produced a false verdict — it under-calls on QK-dense axes but never
+contradicts.
+
+**Equal FLOPs is not equal time.** The reallocation is arithmetically neutral
+but a 128-wide FFN GEMM is less efficient than a 256-wide one, and the 384-wide
+layers do not make it back. Worth remembering for any future fixed-budget
+reshaping: narrowing kernels costs even at constant FLOPs.
+
+### Attention logit algebra — two ideas ruled out on paper
+
+Expanding `q_i·k_j` with the projection biases (`q_i = W_Q x_i + b_Q`,
+`k_j = W_K x_j + b_K`) gives four terms, and softmax over `j` discards anything
+constant along `j`:
+
+| term | depends on | survives softmax? |
+|---|---|---|
+| `(W_Q x_i)·(W_K x_j)` | i, j | yes — the real attention |
+| `(W_Q x_i)·b_K` | i only | no |
+| `b_Q·(W_K x_j)` | j only | yes — per-key content bias |
+| `b_Q·b_K` | neither | no |
+
+**Rejected: `QKᵀ + W1 X + (X W2)ᵀ + B` with W1/W2 shared across heads.** The
+`W1 X` half is a per-query bias, which cancels identically — zero effect, zero
+gradient. The `(X W2)ᵀ` half is a per-key linear functional of content, which
+term 3 already provides: `b_Q·(W_K x_j) = (W_Kᵀ b_Q)·x_j`, and since
+`d_qk 512 > d_model 256` that functional is unconstrained. Sharing across heads
+makes the proposal strictly weaker than what every head has today.
+
+**`b_K` is inert** — it appears only in the two cancelling terms, and `k` is used
+nowhere else. Verified numerically (weights identical to 3e-16 even with a 10×
+bias; `b_Q` control moves them 0.11). Confirmed in the trained net: `b_K` RMS
+~2e-3 against `b_Q`'s ~1.5e-1, **50× smaller, uniformly across all 10 blocks**.
+Not exactly zero despite a zero init, because softmax shift-invariance is exact
+in ℝ but not in floating point — `b_K` picks up a rounding-noise gradient, and
+Adam normalises by gradient magnitude, so even pure noise random-walks the
+parameter at order the learning rate. Holds only because there is
+no RoPE and no QK-norm — a position-dependent or nonlinear transform between
+projection and dot product breaks the argument, which is why it is not general
+MHA folklore. Left in place: removing it would break `StandardRestore` for every
+existing checkpoint, for 0.09% of parameters. Revisit at run4 start.
+
+### Kimi Attention Residuals — assessed, not run
+
+`h_l = Σ_{i<l} α_{i→l} v_i`, attention over depth with a learned per-layer
+pseudo-query ([arXiv:2603.15031](https://arxiv.org/pdf/2603.15031)). Parameters
+negligible, but each layer reads all previous layer outputs: `Σ l × 32 KB`
+= 1.44 MB/position against the current 5.93, so **~+24% memory traffic** on a
+bandwidth-bound net ≈ datagen 70K → ~56K.
+
+Its purpose is fixing depth pathologies (PreNorm dilution, unbounded hidden-state
+growth) measured at 48B/1.4T tokens. **Measured on the exported nets: neither
+pathology exists here.** Numpy forward pass over the ONNX weights (verified
+against onnxruntime to 4e-3), reporting per-sublayer `‖Δ‖/‖x‖`:
+
+| | 10 blk (doubleqk) | 6 blk (run3_e27) |
+|---|---|---|
+| update ratio, blocks 1–2 | 0.181 | 0.138 |
+| update ratio, last 2 blocks | 0.229 | 0.257 |
+| late / early | 1.27 | 1.86 |
+| monotonically declining | no | no |
+
+The trace is U-shaped, not decaying: 0.27 → 0.083 through blocks 1–5, back to
+0.28 at block 9. Residual norm flat across the middle (88 → 102 over six blocks),
+ending at 144 — 1.6× over nine blocks. Later blocks are the *most* active
+proportionally. **Not run:** ~24% traffic for a fix to a problem this depth does
+not have. Block 0 must be excluded from any such summary — the embedding arrives
+at `‖x‖` 3.3 and leaves at 88, a transient that makes any early-vs-late statistic
+report dilution regardless of the rest of the net.
+
+Untested third signature: gradients concentrating in late layers, which needs a
+backward pass and cannot come from an ONNX file.
+
+The Delta variant ([arXiv:2605.18855](https://arxiv.org/pdf/2605.18855)) is a
+different group, preprint, 220M–7.6B, and reports 20% throughput / 26% memory
+overhead — worse for a throughput-bound project.
+
 ### GPU utilisation: memory bound, not compute bound
 
 The model is far too small to saturate the L40S. Estimated from the shapes in

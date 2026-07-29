@@ -12,8 +12,13 @@ def cosine_ff_schedule(num_layers, d_ff=256, start_ratio=1.5, end_ratio=0.5,
     """Per-layer FFN widths tapering wide -> narrow (arXiv:2606.23670).
 
     Capacity concentrates in the early layers. Widths are rounded to
-    `multiple`, then corrected so the total equals `num_layers * d_ff` — the
-    schedule is parameter-, FLOP- and traffic-neutral against a uniform net.
+    `multiple`, then corrected so the total equals `num_layers * d_ff`, so the
+    schedule is parameter- and FLOP-neutral against a uniform net.
+
+    It is NOT throughput-neutral: measured 4.3% slower datagen (70K -> 67K nps)
+    at L=10, d_ff=256, because a 128-wide FFN GEMM is less efficient than a
+    256-wide one and the 384-wide layers do not make it back. Equal FLOPs do
+    not mean equal time when the reallocation narrows kernels.
 
     >>> cosine_ff_schedule(10, 256)
     (384, 384, 384, 320, 256, 256, 192, 128, 128, 128)
@@ -59,6 +64,67 @@ class Attention(nn.Module):
     # training. Softmax is forced back to fp32 regardless.
     dtype: jnp.dtype = jnp.float32
 
+    # --- Dynamic attention bias (scaled-down Smolgen, lczero.org 2024/02) ---
+    # A content-dependent 64x64 map added to the logits, on top of the static
+    # spatial_bias. Unlike spatial_bias it depends on the position, so it lets
+    # attention react to board state (constrain distant squares in closed
+    # positions, open them up otherwise) rather than only to geometry.
+    #
+    # dyn_bias_code = 0 disables it entirely (the default; nothing changes).
+    # Shared across heads within a layer, and NOT shared across layers: Leela
+    # shares its decoder globally only because a full per-head 64x64 decode
+    # would be ~84M parameters over all (layer, head) pairs. One map per layer
+    # is 262K, which fits, so each layer gets its own.
+    #
+    # dyn_bias_rank = 0 decodes the full 64x64 map (4096 outputs).
+    # dyn_bias_rank = r decodes U, V in R^{64 x r} and uses U V^T instead,
+    # which is 4096/(2r) times narrower. Note a rank-1 map of the form
+    # u_i + v_j would be pointless: anything constant along the key axis
+    # cancels in the softmax, so only the v_j half would survive.
+    dyn_bias_code: int = 0
+    dyn_bias_compress: int = 8
+    dyn_bias_rank: int = 0
+
+    def _dynamic_bias(self, x, b, seq):
+        """(b, seq, d_model) -> (b, seq, seq), shared across heads."""
+        dense = functools.partial(nn.Dense, dtype=self.dtype,
+                                  param_dtype=jnp.float32)
+        # Squeeze each square to a few channels before flattening, or the
+        # first dense would be (seq * d_model) wide.
+        c = dense(self.dyn_bias_compress, name="dyn_compress")(x)
+        c = c.reshape((b, seq * self.dyn_bias_compress))
+        c = dense(self.dyn_bias_code, name="dyn_code")(c)
+        # Without this the whole branch collapses to one linear map of x.
+        c = nn.silu(nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32,
+                                 name="dyn_norm")(c))
+
+        if self.dyn_bias_rank > 0:
+            r = self.dyn_bias_rank
+            u = dense(seq * r, name="dyn_u")(c).reshape((b, seq, r))
+            # V starts at zero so the branch is a no-op at init and the net
+            # begins identical to the baseline. Zeroing *both* factors would
+            # trap them: dU = V^T(dL/dM) = 0 and dV = U^T(dL/dM) = 0.
+            #
+            # Note the zero decode also blocks gradient to compress/code/norm/u
+            # for exactly one step, until V becomes nonzero. Verified to
+            # unfreeze immediately: front-end |grad| is 0 at step 0 and ~5e-3
+            # from step 1.
+            v = dense(seq * r, name="dyn_v",
+                      kernel_init=nn.initializers.zeros)(c).reshape((b, seq, r))
+            m = jnp.einsum("bir,bjr->bij", u, v)
+        else:
+            m = dense(seq * seq, name="dyn_decode",
+                      kernel_init=nn.initializers.zeros)(c).reshape(
+                          (b, seq, seq))
+
+        # Retrievable with apply(..., capture_intermediates=True). The point of
+        # this branch is that the map varies with the position; without a hook
+        # there is no way to confirm it does rather than collapsing to a second
+        # static bias, since the helper cannot be called on its own (Flax only
+        # allows submodule creation inside the @compact method).
+        self.sow("intermediates", "dyn_bias", m)
+        return m
+
     @nn.compact
     def __call__(self, x):
         b, seq_len, _ = x.shape
@@ -86,6 +152,10 @@ class Attention(nn.Module):
             (1, self.num_heads, seq_len, seq_len)
         )
         logits = logits + spatial_bias.astype(logits.dtype)
+
+        if self.dyn_bias_code > 0:
+            # (b, seq, seq) -> broadcast over the head axis.
+            logits = logits + self._dynamic_bias(attn_input, b, seq_len)[:, None]
 
         # Softmax in fp32 even in mixed precision: the exponentials and the
         # reduction are where low precision actually costs accuracy, and this
@@ -123,11 +193,19 @@ class ShatranjBlock(nn.Module):
     d_qk_head: int = 64
     d_v_head: int = None
     dtype: jnp.dtype = jnp.float32
+    dyn_bias_code: int = 0
+    dyn_bias_compress: int = 8
+    dyn_bias_rank: int = 0
 
     @nn.compact
     def __call__(self, x):
-        x = Attention(self.d_model, self.num_heads, self.d_qk_head,
-                      self.d_v_head, self.dtype)(x)
+        # Keyword args deliberately: Attention has enough optional fields that
+        # positional construction breaks silently when one is inserted.
+        x = Attention(d_model=self.d_model, num_heads=self.num_heads,
+                      d_qk_head=self.d_qk_head, d_v_head=self.d_v_head,
+                      dtype=self.dtype, dyn_bias_code=self.dyn_bias_code,
+                      dyn_bias_compress=self.dyn_bias_compress,
+                      dyn_bias_rank=self.dyn_bias_rank)(x)
         x = FeedForward(self.d_model, self.d_ff, self.dtype)(x)
         return x
 
@@ -136,13 +214,13 @@ class ShatranjNet(nn.Module):
     d_model: int = 256
     num_heads: int = 8
     # int = uniform width; tuple of length num_layers = per-layer widths
-    # (see cosine_ff_schedule). Must be a tuple, not a list — Flax hashes it.
-    # Tapered wide -> narrow: (384, 384, 384, 320, 256, 256, 192, 128, 128, 128).
-    # Sums to 10*256, so parameters, FLOPs and memory traffic are unchanged
-    # against uniform d_ff=256 — this is purely a reallocation of capacity
-    # toward the early layers. The 10 must match num_layers; the block loop
-    # raises if it does not.
-    d_ff: Union[int, Sequence[int]] = cosine_ff_schedule(10, 256)
+    # (see cosine_ff_schedule, kept for future reshaping experiments). Must be
+    # a tuple, not a list — Flax hashes it.
+    #
+    # Uniform 256 after the cosine taper was tested and rejected: paired loss
+    # +0.0002 +/- 0.0018 and a 400-game match at +6.9 +/- 15.8 both said no
+    # effect, while datagen dropped 4.3%.
+    d_ff: Union[int, Sequence[int]] = 256
     d_qk_head: int = 64
     d_v_head: int = None
     # jnp.bfloat16 runs the trunk in mixed precision: weights stay float32, only
@@ -151,6 +229,10 @@ class ShatranjNet(nn.Module):
     # so halving activation traffic is the main lever left on training speed.
     # Outputs are always returned as float32 so the loss is unaffected.
     dtype: jnp.dtype = jnp.float32
+    # See Attention for what these mean. 0 = off, unchanged from before.
+    dyn_bias_code: int = 0
+    dyn_bias_compress: int = 8
+    dyn_bias_rank: int = 0
     vocab_size: int = 13 * 64
     max_halfmoves: int = 140
 
@@ -183,8 +265,12 @@ class ShatranjNet(nn.Module):
             raise ValueError(f"d_ff has {len(widths)} entries, "
                              f"num_layers is {self.num_layers}")
         for width in widths:
-            x = ShatranjBlock(self.d_model, self.num_heads, width,
-                              self.d_qk_head, self.d_v_head, self.dtype)(x)
+            x = ShatranjBlock(d_model=self.d_model, num_heads=self.num_heads,
+                              d_ff=width, d_qk_head=self.d_qk_head,
+                              d_v_head=self.d_v_head, dtype=self.dtype,
+                              dyn_bias_code=self.dyn_bias_code,
+                              dyn_bias_compress=self.dyn_bias_compress,
+                              dyn_bias_rank=self.dyn_bias_rank)(x)
 
         x = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(x)
 
