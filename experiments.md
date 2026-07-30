@@ -16,6 +16,67 @@ Matches with access to raw cutechess logs are rescored with
 
 ---
 
+# Standing rules
+
+Distilled from the results below — what to check before designing an experiment,
+not conclusions about any one change.
+
+**Measurement**
+
+- Score every paired-opening match with
+  [testing/pentanomial.py](testing/pentanomial.py). Cutechess's trinomial bars
+  charge for book variance the pairing already cancels; on real matches this cut
+  the standard error 17–28%, enough to flip a result from non-significant to
+  significant.
+- **Noise floor ≈ 0.0065 nats ≈ ~10 Elo.** Two architecturally identical nets,
+  separately trained, differ by that much. Single-seed changes below ~2× the
+  floor are unmeasurable by loss *or* by match — either clear it or run multiple
+  seeds. Paired `--vs` validation cancels batch difficulty but **not** seed
+  variance, so its tight CI is falsely precise for architecture comparisons.
+- **Always split the loss by component.** `Q_WEIGHT = 48` (`train.py:31`) makes
+  `total = policy + wdl + 48·q_mse`, so a total can be dominated by a tiny MSE
+  move. Never quote a total for a change that shifts the policy/value mix.
+- Screen with `validation.py --vs` first (free with the train); spend a 400-game
+  match only when loss is ambiguous or the Elo number itself is wanted. Not all
+  nats convert equally — QK-dense axes run ~2500–3400 Elo/nat against depth's
+  ~1600.
+- Validate on **held-out** data. Roughly 55–60% of a capacity gain survives out
+  of sample; the rest is fitting the training window.
+- **nps is comparable only at equal nodes/move**, and only at equal batch fill —
+  fill decays through a run as games reach endgames.
+- **Verify a checkpoint's actual config immediately after training** (dump the
+  orbax tree or Netron the ONNX). A mislabeled `d_ff 512` net propagated through
+  a match, a loss test, a datagen reading and an adopted default before it was
+  caught.
+
+**Throughput**
+
+- **Predict cost from the dumped graph, not from arithmetic.**
+  `SZ0_DUMP_OPTIMIZED=<path> ./SZ0`, then `inspect_graph.py --raw`, and diff the
+  fused-op counts. Three consecutive predictions made from FLOPs and bytes alone
+  were wrong, one of them by 15×.
+- On a **fused** graph, the cost of a new op is dominated by *which fusion it
+  breaks*, not by its own FLOPs or bytes.
+- On a **small** model, cost is dominated by *node count*, not work — at
+  `d_model = 256` every kernel is tiny, so ~1.6 µs of per-kernel overhead swamps
+  the arithmetic. CUDA graph capture reduces this but does not remove it: it
+  eliminates CPU-side launch overhead, not GPU-side per-kernel scheduling.
+- **Equal FLOPs is not equal time.** Narrow GEMMs are less efficient, so
+  fixed-budget reallocation costs rather than being free.
+- The net is **memory bound** (~53% of the L40S's 864 GB/s during the GPU
+  phase), so depth costs full price and width is partially discounted.
+- **Never measure the graph with the pip `onnxruntime`** — a different build and
+  provider from the engine's linked library, and fusion differs by both.
+
+**Architecture**
+
+- `d_qk_head` and `d_policy_head` are **rank caps on bilinear forms**, and this
+  net is very rank-sensitive: qk 32→16 cost −37.5 Elo, 32→64 gained +20.9.
+- Softmax over `j` discards anything constant along `j`, which kills every
+  per-query additive term — see the logit algebra under run4.
+
+---
+
 # Search
 
 ## Particle MCTS
@@ -380,41 +441,68 @@ comparable to each other but *not* to anything measured after — the same qk64
 net that read 47K reads 62K now. Architecture cost ratios between them still
 hold; absolute numbers do not.
 
+### Results at a glance
+
+400 games paired 6s+0.1 unless noted; loss is paired `--vs` on the same fixed
+sample. Noise floor ~0.0065 nats / ~10 Elo, so anything inside that is a null.
+
+| Change | Loss | Match (pentanomial) | Datagen | Verdict |
+|---|---|---|---|---|
+| 6 → 10 blocks | −0.0204 | +33.1 ± 24.8 @ 5000 nodes | −38% | **adopted** |
+| `d_qk_head` 32 → 64 | −0.0079 | +20.9 ± 17.7, LOS 99% | −20% | **adopted** |
+| `d_qk_head` 32 → 16 | +0.0149 | −37.5 ± 16.7, LOS ~0% | +7% | rejected |
+| `d_ff` 256 → 512 | +0.0063 (confounded) | — | ~−10% | rejected |
+| Cosine `d_ff` taper | +0.0002 | +6.9 ± 15.8 | −4.3% | rejected |
+| Dynamic attention bias, rank 4 | −0.0151 held out | +0.9 ± 17.5 | −16.4% | rejected, revisit at larger `d_model` |
+| `d_policy_head` 64 → 256 | — | — | ~−3% predicted | **pending** |
+| Attention residuals (Kimi) | — | — | ~−24% predicted | not run, premise measured false |
+| `QKᵀ + W1X + (XW2)ᵀ` | — | — | — | rejected on paper (per-query term cancels) |
+
+Two results that outlived their experiments: **loss screening works** between
+identically-trained fresh nets, with four calibration points and no false
+verdicts — but only when read per component. And **throughput must be predicted
+from the dumped graph**, not from FLOPs. Both are in the standing rules at the
+top.
+
 Open follow-ups:
 
-- figure out how to close the ~67 Elo data/iterative gap (below) — 10× the
-  noise floor, unlike any architecture tweak so far, will likely need to wait for
-  run4 to make more headway on this
-- increase data window and/or train longer (confounded — see below)
-- reserve a small slice of datagen for representative validation
-- datagen throughput budget — 60K at 300 nodes/move vs 95K originally (was 47K
-  before the inference-path fixes, but that was measured at a different
-  nodes/move — see the nps caveat below); decide explicitly rather than letting
-  adoptions erode it further
-- double-buffer datagen: two game pools alternating, so tree work hides under
-  the next batch's GPU work. Ceiling ~73K nps, biggest remaining lever
+- **close the ~67 Elo data/iterative gap** — 10× the noise floor, unlike any
+  architecture tweak so far. The step-count fit below now suggests it may be
+  optimisation rather than data; score the six dyn-bias checkpoints held out to
+  settle which, then try an end-of-run LR anneal (cheap) before more data
+  (expensive)
+- **policy head 64 → 256** — implemented, not yet trained; the last run4 item
+- datagen throughput budget — 70K at 300 nodes/move vs 95K originally; decide
+  explicitly rather than letting adoptions erode it further
+- widen `d_model` — raises arithmetic intensity but also traffic, costly for
+  datagen unless nodes/move can drop. Also where the dynamic attention bias
+  would be revisited (run5)
 - MoE: not optimistic (Leela failed; MoE adds params + traffic, the wrong
   trade for a memory-bound, data-limited net). Head specialization IS proven —
   NNUE output buckets are hard-routed head-MoE (hand-selected by piece count).
   For a data-limited net prefer a hand-designed router over a learned gate.
   Caveat: a deep trunk may already learn phase-conditioning implicitly, so less
-  headroom than shallow NNUE. 
-- per-layer `d_ff` schedule (wider in EARLY layers) — fixed-budget reallocation
-  so ~neutral throughput, but the effect is sub-floor: needs multi-seed or a
-  large reallocation to detect
-- widen `d_model` — raises intensity but also traffic, 
-  will be pretty costly for datagen, unless nodes can decrease
+  headroom than shallow NNUE.
+- `num_heads` 8 → 16 — decouple `d_v_head` first, or it is three variables at
+  once (scores tensor doubles, spatial bias doubles, V head dim halves)
+- remove the inert `b_K` at the start of official run4 (breaks `StandardRestore`
+  for every existing checkpoint, so it has to happen at a boundary)
 - confirm whether the 3.4% `run` rise is GPU clock throttle (`nvidia-smi -q -d
   CLOCK` during datagen)
+
+Closed since this list was written: double-buffered datagen (done, 70K), a
+reserved held-out validation slice (done), per-layer `d_ff` schedule (tested and
+rejected — see the cosine taper below).
 
 ### The baseline anchor is ~67 Elo below the iterative net
 
 100 games, paired openings, fresh 6-block vs `run3_epoch28`:
 −66.8 ± 36.4 pentanomial, LOS 0.01%.
 
-Likely insufficient data — loss seems to saturate. 
-See below, but validation indicates probably no major overfitting
-Need more testing later, probably ~150-200M positions to match.
+Originally read as insufficient data, on the basis that loss appeared to
+saturate. **The step-count fit below overturns the saturation reading** and
+points at optimisation instead; the two are still confounded on training-window
+loss. Validation indicates no major overfitting either way.
 
 | Net | Current window | Old slice |
 |---|---|---|
@@ -475,18 +563,23 @@ Adopted despite TC falling short of significance: datagen is fixed-node, so the
 relevant figure is +33 against 38% fewer positions per hour. Caveats: one
 training seed.
 
-### Measurement floor: run-to-run variance ≈ 0.0065 nats ≈ ~10 Elo
+### Measurement floor, and the mislabeled `d_ff 512` net
 
-"d_ff 512" checkpoint was mislabeled and actually `d_ff 256`.
-Two architecturally identical 10-block nets (separate training runs, same step
-count) differ by 0.0065 (roughly 10 Elo) in total validation loss. Future runs
-will focus more on datagen throughput as the decider.
+Where the ~0.0065 nat / ~10 Elo floor in the standing rules came from: two
+architecturally identical 10-block nets, separately trained to the same step
+count, differ by that much in total validation loss.
 
-The one real `d_ff 512` net (also `qk 16`, so confounded) scores +0.0063 vs a `d_ff 256` net,
-within the noise floor above, no quality signal. Datagen: `d_ff 512 + qk 16` runs 55K nps vs 59K
-for `d_ff 256 + qk 32`, ~7% slower despite qk 16 helping, so `d_ff 512` alone
-costs more than that. Default remains `d_ff 256`. 
-`d_qk_head` kept as a parameter (default = `d_model // num_heads`).
+It surfaced because the "d_ff 512" checkpoint was **mislabeled and actually
+`d_ff 256`** — so the "adopted, −0.0065" result had been two `d_ff 256` nets,
+i.e. pure seed noise. Root cause was `max_to_keep=None` plus a reused directory
+name, hence the standing rule about verifying a checkpoint's config immediately
+after training.
+
+The one real `d_ff 512` net (also `qk 16`, so confounded) scores +0.0063 against
+a `d_ff 256` net — inside the floor, no quality signal. Datagen: `d_ff 512 +
+qk 16` runs 55K vs 59K for `d_ff 256 + qk 32`, ~7% slower *despite* qk 16
+helping, so `d_ff 512` alone costs more than that. Default stays `d_ff 256`, and
+`d_qk_head` was kept as a parameter.
 
 ### qk 32 → 16 — strongly negative, rejected
 
@@ -593,51 +686,28 @@ projection and dot product breaks the argument, which is why it is not general
 MHA folklore. Left in place: removing it would break `StandardRestore` for every
 existing checkpoint, for 0.09% of parameters. Revisit at run4 start.
 
-### Dynamic attention bias (scaled-down Smolgen) — rank 4 trained, null match
+### Dynamic attention bias (scaled-down Smolgen) — rank 4 trained, rejected
 
 Content-dependent 64×64 map added to the logits alongside the static
-`spatial_bias`, so attention can react to the position rather than only to
-geometry ([Leela](https://lczero.org/blog/2024/02/transformer-progress/)).
-Shared across heads within a layer; **not** shared across layers — Leela shares
-its decoder globally only because a per-head full decode would be ~84M
-parameters over all (layer, head) pairs, which low rank or head-sharing avoids.
-
+`spatial_bias`, shared across heads within a layer but not across layers
+([Leela](https://lczero.org/blog/2024/02/transformer-progress/)).
 `architecture.py`: `dyn_bias_code` (0 = off, the default), `dyn_bias_rank`
 (0 = full 64×64 decode, r > 0 = rank-r `U Vᵀ`), `dyn_bias_compress`.
 
-| variant | params | vs base | FLOPs | traffic | pos/param |
-|---|---|---|---|---|---|
-| off | 5.92M | — | — | — | 21 |
-| rank 4, code 64 | 6.60M | +11.5% | +0.6% | +1.4% | 19 |
-| rank 8, code 64 | 6.94M | +17.2% | +0.8% | +1.4% | 18 |
-| full, code 64 | 8.93M | +50.9% | +1.2% | +1.4% | 14 |
-| full, code 256 (Leela's) | 17.79M | +200% | — | — | 7 |
+| variant | params | vs base | pos/param |
+|---|---|---|---|
+| off | 5.92M | — | 21 |
+| rank 4, code 64 | 6.60M | +11.5% | 19 |
+| rank 8, code 64 | 6.94M | +17.2% | 18 |
+| full, code 64 | 8.93M | +50.9% | 14 |
+| full, code 256 (Leela's) | 17.79M | +200% | 7 |
 
-The FLOPs and traffic columns are the *predicted* cost of the new ops in
-isolation. **They were wrong by 15× — see the throughput section below.** Kept
-here as a record of the mistake, not as guidance.
+**Match (rank 4, 400 games paired 6s+0.1 vs `sz0_doubleqk`): +0.9 ± 17.5
+pentanomial**, pairs `[0, 52, 95, 53, 0]`, LOS 53.9% — null. Paired validation
+said −0.0242, 3.7× the noise floor. Both are correct; the total is the wrong
+statistic.
 
-Verified: parameter counts, exact no-op at init (final decode zero-initialised),
-content-dependence (map varies 0.97 across boards in one batch after 30 steps,
-via a `sow` hook readable with `capture_intermediates=True`), gradients reaching
-every stage, and `to_onnx` + `make_dynamic` handling the new ops and reshapes
-(zero unpatched batch reshapes vs baseline). **Not verified: `optimize_model` +
-fp16**, which needs torch — export a random net on the server before training.
-
-Gotcha worth keeping: the zero-init decode blocks gradient to the whole front
-end (compress/code/norm/u) at step 0, since a zero kernel has zero Jacobian. It
-unfreezes at step 1 (front-end ‖grad‖ 0 → 5e-3). Zeroing *both* rank factors
-would trap them permanently — only `V` is zeroed.
-
-#### Result: rank 4 is a real but small quality gain, at an unaffordable price
-
-400 games paired 6s+0.1 vs `sz0_doubleqk`: **+0.9 ± 17.5 pentanomial**, pairs
-`[0, 52, 95, 53, 0]`, LOS 53.9% — null. Paired validation loss said −0.0242,
-3.7× the 0.0065 seed floor, which looked like a clear win. Both are correct;
-the total is just the wrong statistic.
-
-**`Q_WEIGHT = 48` (`train.py:31`) means `total = policy + wdl + 48·q_mse`.**
-Splitting the final checkpoint's delta:
+**`Q_WEIGHT = 48` means `total = policy + wdl + 48·q_mse`:**
 
 | component | trained-on | held out | share of total |
 |---|---|---|---|
@@ -646,21 +716,22 @@ Splitting the final checkpoint's delta:
 | 48 × q_mse | −0.0144 | −0.0096 | **59%** |
 | total | −0.0242 | −0.0151 | |
 
-The Q term moved 0.0041 → 0.0038 MSE — RMS error on expected value 0.064 →
-0.062 — and the 48× weight presents that as 0.014 nats. On the components the
-engine consumes, policy and wdl, the change is under the noise floor.
+The Q term moved 0.0041 → 0.0038 MSE (RMS error on expected value 0.064 →
+0.062) and the 48× weight presents that as 0.014 nats. On the components the
+engine consumes, the change is under the floor. **62% of the gain survives
+held-out**, in line with the 10-block net's 56%, so it is real but small — and
+the engine was searching ~8% fewer nodes, worth ~−4 Elo, so quality-per-node is
+plausibly ~+5.
 
-**Do not quote total paired loss for any change that shifts the policy/value
-mix. Always split it.** The earlier calibration points (qk16, qk64, cosine
-taper) were never split and should be re-read before the ~1600–2500 Elo/nat
-range is trusted.
+The gain is **77% value-side: 1.39% relative improvement in value against 0.26%
+in policy.** Mechanism: `U` and `V` are not per-token linear projections but
+nonlinear functions of the *whole board*, so the rank-4 score term delivers a
+global board summary, which is value-shaped information. Extra QK dims buy
+relational precision instead — the two are not competing on the same axis. Per
+parameter it is ~4× more loss-efficient than qk32→64 (683k params for −0.0151
+held out, vs 1.31M for −0.0079).
 
-Held-out validation clears the memorisation worry: **62% of the gain survives
-out of sample** (−0.0151 of −0.0242), in line with the 10-block net's 56%. The
-gain is real, just small. The engine was also searching ~8% fewer nodes at the
-time of the match, worth about −4 Elo, so quality-per-node is plausibly ~+5.
-
-#### Throughput: −16% datagen, −24% search. The cost is node count.
+**Throughput: −16.4% datagen, −23.5% search. Predicted +1%.**
 
 | | baseline | rank 4 | |
 |---|---|---|---|
@@ -668,85 +739,49 @@ time of the match, worth about −4 Elo, so quality-per-node is plausibly ~+5.
 | search, batch 32, no CUDA graph | 27.5K | 20.5K | −25.5% |
 | search, batch 32, CUDA graph | 34.0K | 26.0K | −23.5% |
 
-Predicted +1%. Two mechanisms, neither of which is the new arithmetic.
+Two mechanisms, neither of them the new arithmetic.
 
-**1. The extra bias add un-fuses `BiasSoftmax`.** Confirmed by
-`SZ0_DUMP_OPTIMIZED=dynbias_opt.onnx ./SZ0` + `inspect_graph.py --raw`:
-`BiasSoftmax` went **10 → 0**, replaced by `Softmax ×10` and raw `Add`s; the
-graph went 322 → 462 nodes. The scores tensor is the largest in the net
-(8·64·64 = 64 KB/position/block) and it now round-trips through memory two
-extra times per block.
-
-Reordering the adds cannot be replaced by *summing* the two biases first:
-`(1,h,64,64) + (b,1,64,64) → (b,h,64,64)`, a tensor the same size as the
-scores, so you write a full-size tensor to avoid reading one. Per block per
-position, in 64 KB units:
-
-| | matmul | bias adds | softmax | total |
-|---|---|---|---|---|
-| baseline | w1 | *(fused)* | r1+w1 | 192 KB |
-| current | w1 | r1+w1, r1+w1 | r1+w1 | 456 KB |
-| pre-summed biases | w1 | w1 | r2+w1 | 320 KB |
-| reordered | w1 | r1+w1 | r1+w1 | 320 KB |
-
-`BiasSoftmax` needs a bias that broadcasts on the outer or inner dims;
+**(1) The extra bias add un-fuses `BiasSoftmax`.** Confirmed by
+`SZ0_DUMP_OPTIMIZED` + `inspect_graph.py --raw`: 10 → 0, replaced by
+`Softmax ×10` and raw `Add`s, graph 322 → 462 nodes. The scores tensor is the
+largest in the net (64 KB/position/block) and now round-trips extra times.
+`BiasSoftmax` needs a bias broadcasting on the outer or inner dims:
 `spatial_bias` is `(1,h,64,64)` and fuses, the dynamic map is `(b,1,64,64)` and
-broadcasts on the **head** axis, which is neither. So the fix is to put the
-dynamic add *first*, leaving the fusable constant adjacent to the softmax —
-one line at `architecture.py:159-163`, no change to the function computed.
+broadcasts on the **head** axis, which is neither.
 
-**2. Per-kernel overhead on a 43% larger graph — the bigger half.** Fitting the
-two graph-on measurements to `cost = a + b·batch`:
+**(2) Per-kernel overhead on a 43% larger graph — the bigger half.** Fitting
+`cost = a + b·batch` to the two graph-on points (+290 µs at batch 32, +799 µs at
+284) gives **a = 225 µs/batch fixed, b = 2.02 µs/position**. Both terms confirm
+independently: 225 µs / 140 nodes = **1.61 µs per node**, and 2.02 µs/pos ×
+864 GB/s = **1.75 MB/pos** against the 2.64 MB/pos the round-trip model predicts
+with ~⅓ L2-served. At batch 32 the fixed term alone is 24% of the entire forward
+pass. So it is ~⅓ bandwidth and ~⅔ node count, which is why CUDA graph capture
+barely helps (−25.5% → −23.5%).
 
-```
-+290 µs = a +  32b   =>   a = 225 µs per batch (fixed)
-+799 µs = a + 284b        b = 2.02 µs per position
-```
+Fixes considered. **Reordering the two adds**, so the fusable constant sits
+adjacent to the softmax, is one line and recovers the bandwidth half (predicted
+58.5K → ~64.5K, 26K → ~27.6K) but still leaves −8%/−19%. **Pre-summing** the
+biases gains nothing over that: the sum is `(b,h,64,64)`, so you write a
+full-size tensor to avoid reading one. **The QK-concat idea is withdrawn** —
+`S + U Vᵀ` is algebraically `r` extra QK dims, so folding `U` into q and `Vᵀ`
+into k removes the add, but it adds `Expand`+`Concat` ×2 per block, i.e. *more*
+nodes, and node count dominates.
 
-Both terms are independently confirmable: **225 µs / 140 nodes = 1.61 µs per
-node**, textbook captured-graph per-kernel overhead; and **2.02 µs/pos ×
-864 GB/s = 1.75 MB/pos**, against the 2.64 MB/pos the round-trip model predicts
-with roughly a third L2-served (the scores tensor is 18.6 MB at batch 284,
-2.1 MB at batch 32, both inside the L40S's 48 MB L2).
-
-So it is ~⅓ bandwidth and ~⅔ per-kernel overhead. At batch 32 the fixed term
-alone is 24% of the entire forward pass.
-
-**CUDA graph capture does not fix this.** It removes CPU-side launch overhead
-(−25.5% → −23.5%, about 0.76 µs/node), but a captured graph still executes 462
-kernels in sequence and each retains ~1.6 µs of GPU-side scheduling regardless
-of how little work it does.
-
-**Consequence: the QK-concat idea is withdrawn.** `S + U Vᵀ` is algebraically
-the score contribution of `r` extra QK dims, so concatenating `U` onto q and
-`Vᵀ` onto k folds the whole thing into the existing `FusedMatMul` — an elegant
-bandwidth fix. But it removes one `Add` while adding `Expand`+`Concat` ×2 per
-block, i.e. *more* nodes, and node count is the dominant term.
-
-**Verdict: rejected as implemented.** The reorder is free and worth doing
-(predicted datagen 58.5K → ~64.5K, search 26K → ~27.6K) but still leaves −8%
-and −19% for ~+5 Elo, against depth's 0.87 Elo per % of nps. A per-block
+**Rejected at this model size; shelved for run5 when `d_model` grows.** ~+5 Elo
+for 20–24% throughput, against depth's 0.87 Elo per % of nps. A per-block
 Smolgen branch is ~14 tiny kernels amortised over a `d_model=256` block that
-takes ~94 µs at batch 32; Leela's design assumes a much larger net. The only
-variants with a path are one branch shared across all 10 blocks (140 → ~24
+takes ~94 µs at batch 32; Leela's design assumes a much larger net. If revisited,
+the surviving variants are one branch shared across all 10 blocks (140 → ~24
 nodes, ≈ −7%) or applying it to a subset of blocks — both of which would also
-shrink the ~+5 Elo.
+shrink the +5 Elo.
 
-#### Generalisable: predict throughput from the graph, not from arithmetic
-
-The most useful throughput lesson of the project so far. Two rules, both
-learned by being wrong here:
-
-1. **On a fused graph, the cost of a new op is dominated by which fusion it
-   breaks, not by its own FLOPs or bytes.** The +1% estimate counted the new
-   ops' traffic correctly and was irrelevant.
-2. **On a small model, cost is dominated by node count, not by work.** At
-   `d_model=256` every kernel is tiny, so ~1.6 µs of per-kernel overhead
-   swamps the arithmetic. CUDA graph capture reduces this but does not remove
-   it.
-
-Always dump the optimised graph and diff the fused-op counts before predicting
-the cost of an architecture change.
+Verified at implementation: parameter counts, exact no-op at init,
+content-dependence (the map varies 0.97 across boards in one batch after 30
+steps, via a `sow` hook), gradients reaching every stage, and `to_onnx` +
+`make_dynamic` handling the new ops and reshapes. Gotcha worth keeping: the
+zero-init decode blocks gradient to the whole front end at step 0, since a zero
+kernel has zero Jacobian; it unfreezes at step 1. Zeroing *both* rank factors
+would trap them permanently — only `V` is zeroed.
 
 ### Policy head width 64 → 256 — implemented, not yet trained
 
