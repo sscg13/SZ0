@@ -60,7 +60,7 @@ def summarise(name, values):
 
 
 def load_net(run_dir, blocks, step, d_ff=None, d_qk_head=None,
-             dyn_bias_code=None, dyn_bias_rank=None):
+             dyn_bias_code=None, dyn_bias_rank=None, d_policy_head=None):
     """Restore a checkpoint into a TrainState. Returns (state, label)."""
     overrides = {}
     if blocks is not None:
@@ -69,6 +69,8 @@ def load_net(run_dir, blocks, step, d_ff=None, d_qk_head=None,
         overrides["d_ff"] = d_ff
     if d_qk_head is not None:
         overrides["d_qk_head"] = d_qk_head
+    if d_policy_head is not None:
+        overrides["d_policy_head"] = d_policy_head
     if dyn_bias_code is not None:
         overrides["dyn_bias_code"] = dyn_bias_code
     if dyn_bias_rank is not None:
@@ -108,7 +110,8 @@ def load_net(run_dir, blocks, step, d_ff=None, d_qk_head=None,
            f"code {model.dyn_bias_code}, "
            f"{'full' if model.dyn_bias_rank == 0 else f'rank {model.dyn_bias_rank}'}")
     label = (f"{run_dir} step {step} | {model.num_layers} blocks, "
-             f"d_ff {ff}, d_qk_head {qk}, dyn_bias {dyn} | {nparams:,} params")
+             f"d_ff {ff}, d_qk_head {qk}, d_policy_head {model.d_policy_head}, "
+             f"dyn_bias {dyn} | {nparams:,} params")
     return state, label
 
 
@@ -133,6 +136,10 @@ def main():
                          "delta (this minus --vs), which cancels batch "
                          "difficulty and is far tighter than comparing two "
                          "separate runs' means")
+    ap.add_argument("--d-policy-head", type=int, default=None,
+                    help="policy head width of the checkpoint; caps the rank "
+                         "of the 256x256 bilinear form the head computes "
+                         "(default: architecture.py's current default)")
     ap.add_argument("--dyn-bias-code", type=int, default=None,
                     help="dynamic attention bias code dim, 0 = off (default: "
                          "architecture.py's current default)")
@@ -142,6 +149,7 @@ def main():
     ap.add_argument("--vs-blocks", type=int, default=None)
     ap.add_argument("--vs-d-ff", default=None)
     ap.add_argument("--vs-d-qk-head", type=int, default=None)
+    ap.add_argument("--vs-d-policy-head", type=int, default=None)
     ap.add_argument("--vs-dyn-bias-code", type=int, default=None)
     ap.add_argument("--vs-dyn-bias-rank", type=int, default=None)
     ap.add_argument("--batches", type=int, default=1000,
@@ -153,7 +161,8 @@ def main():
 
     state_a, label_a = load_net(args.run_dir, args.blocks, args.step,
                                 parse_d_ff(args.d_ff), args.d_qk_head,
-                                args.dyn_bias_code, args.dyn_bias_rank)
+                                args.dyn_bias_code, args.dyn_bias_rank,
+                                args.d_policy_head)
     print(label_a)
     eval_a = jax.jit(
         lambda params, batch: compute_loss(params, state_a.apply_fn, batch)
@@ -164,7 +173,8 @@ def main():
         state_b, label_b = load_net(args.vs, args.vs_blocks, args.vs_step,
                                     parse_d_ff(args.vs_d_ff), args.vs_d_qk_head,
                                     args.vs_dyn_bias_code,
-                                    args.vs_dyn_bias_rank)
+                                    args.vs_dyn_bias_rank,
+                                    args.vs_d_policy_head)
         print(f"  vs  {label_b}")
         eval_b = jax.jit(
             lambda params, batch: compute_loss(params, state_b.apply_fn, batch)

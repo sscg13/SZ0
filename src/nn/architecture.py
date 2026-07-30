@@ -228,6 +228,22 @@ class ShatranjNet(nn.Module):
     d_ff: Union[int, Sequence[int]] = 256
     d_qk_head: int = 64
     d_v_head: int = None
+    # Policy head width. The head is a single bilinear form:
+    #   policy[i,j] = (x_i W_from) . (x_j W_to) = x_i^T A x_j,  A = W_from W_to^T
+    # so this caps the rank of A, which is 256x256 -- 64 is a 4x restriction,
+    # and d_policy_head=256 removes it entirely. Compare d_qk_head, where this
+    # net turned out to be very rank-sensitive (32->16 cost 37.5 Elo).
+    #
+    # Measured on sz0_doubleqk_epoch6: neither projection has dead directions
+    # (W_from's smallest singular value is a quarter of its largest, spectrum
+    # close to the random-matrix baseline), so weight decay found no surplus to
+    # prune at 64. That rules out "64 is already enough"; it does not prove 256
+    # helps, since a rank-64 truncation of a higher-rank optimum looks similar.
+    #
+    # Note the caveat: for any single position the 64 tokens span at most a
+    # 64-dim subspace, so the rank cap never binds within one board. It binds
+    # across boards -- a rank-64 A must reuse the same subspace for all of them.
+    d_policy_head: int = 64
     # jnp.bfloat16 runs the trunk in mixed precision: weights stay float32, only
     # activations and matmul inputs narrow. The model is bandwidth-bound (the
     # dominant GEMM sits at ~63 FLOP/byte against an L40S ridge point near 209),
@@ -287,11 +303,14 @@ class ShatranjNet(nn.Module):
         v = nn.relu(v)
         value_logits = dense(3)(v)
 
-        # Policy Head (Dot-Product)
-        p_from = dense(64)(x)
-        p_to = dense(64)(x)
+        # Policy Head (Dot-Product). The scale must track d_policy_head or the
+        # logit variance at init changes with it; math.sqrt(64) == 8.0, so this
+        # is exactly the previous behaviour at the default.
+        p_from = dense(self.d_policy_head)(x)
+        p_to = dense(self.d_policy_head)(x)
         p_to_transposed = jnp.swapaxes(p_to, -1, -2)
-        policy_logits = jnp.matmul(p_from, p_to_transposed) / 8.0
+        policy_logits = (jnp.matmul(p_from, p_to_transposed)
+                         / math.sqrt(self.d_policy_head))
 
         # Always hand fp32 to the loss / exporter, whatever the trunk ran in.
         return (policy_logits.astype(jnp.float32),

@@ -422,6 +422,38 @@ Need more testing later, probably ~150-200M positions to match.
 | 10 blocks | 2.3789 | 2.1951 |
 | run3_epoch28 | 2.3236 | 2.1269 |
 
+#### Step count alone can account for the gap (2026-07-30)
+
+The dyn-bias run produced validation on all six 300k-step checkpoints, which is
+the loss-vs-log(step) fit that was an open follow-up here. Dropping checkpoint 1
+as the embedding transient:
+
+| step | 600k | 900k | 1200k | 1500k | 1800k |
+|---|---|---|---|---|---|
+| total | 2.4259 | 2.4003 | 2.3763 | 2.3627 | 2.3538 |
+
+A clean log law, **slope −0.0675 nats per e-fold of steps, no saturation.**
+Extrapolating 1.8M → `run3_epoch28`'s 8.4M cumulative steps gives **−0.104
+nats**, against a remaining gap of only 0.054 (doubleqk final 2.3779 vs run3
+2.3236). Step count over-covers the gap on its own.
+
+This is *not* the LR-schedule claim, which was already ruled out — run3 used the
+same constant 1e-4, it just took 4.7× more steps to get there. It also
+contradicts the earlier "loss saturates" reading above, which was a linear fit
+inside the last 100k steps and badly under-powered next to six checkpoints
+spanning 6× in steps.
+
+Two caveats it cannot resolve by itself: the fit is on the dyn-bias run, which
+has 11.5% more parameters and so more room to keep fitting; and 8.4M steps over
+a 127.5M window is ~18.7 epochs, so on *training-window* loss "more steps" and
+"fits the window better" are the same curve. Held-out validation now works, so
+scoring these same six checkpoints out of sample settles it: if the slope
+survives, it is undertraining and an end-of-run LR anneal is the cheap fix; if
+it flattens, it is data and the anneal buys nothing.
+
+Cheapest probe either way, far short of doubling a 13-hour run: cosine-decay the
+LR over the last 200–300k steps.
+
 ### 6 → 10 transformer blocks — adopted
 
 200 games head-to-head, paired openings, batch 32 fp16:
@@ -561,7 +593,7 @@ projection and dot product breaks the argument, which is why it is not general
 MHA folklore. Left in place: removing it would break `StandardRestore` for every
 existing checkpoint, for 0.09% of parameters. Revisit at run4 start.
 
-### Dynamic attention bias (scaled-down Smolgen) — implemented, untested
+### Dynamic attention bias (scaled-down Smolgen) — rank 4 trained, null match
 
 Content-dependent 64×64 map added to the logits alongside the static
 `spatial_bias`, so attention can react to the position rather than only to
@@ -581,8 +613,9 @@ parameters over all (layer, head) pairs, which low rank or head-sharing avoids.
 | full, code 64 | 8.93M | +50.9% | +1.2% | +1.4% | 14 |
 | full, code 256 (Leela's) | 17.79M | +200% | — | — | 7 |
 
-Throughput is ~1% for every variant — **the cost is parameters**, which is the
-awkward axis given the data-limited diagnosis. Run rank 4 first.
+The FLOPs and traffic columns are the *predicted* cost of the new ops in
+isolation. **They were wrong by 15× — see the throughput section below.** Kept
+here as a record of the mistake, not as guidance.
 
 Verified: parameter counts, exact no-op at init (final decode zero-initialised),
 content-dependence (map varies 0.97 across boards in one batch after 30 steps,
@@ -595,6 +628,173 @@ Gotcha worth keeping: the zero-init decode blocks gradient to the whole front
 end (compress/code/norm/u) at step 0, since a zero kernel has zero Jacobian. It
 unfreezes at step 1 (front-end ‖grad‖ 0 → 5e-3). Zeroing *both* rank factors
 would trap them permanently — only `V` is zeroed.
+
+#### Result: rank 4 is a real but small quality gain, at an unaffordable price
+
+400 games paired 6s+0.1 vs `sz0_doubleqk`: **+0.9 ± 17.5 pentanomial**, pairs
+`[0, 52, 95, 53, 0]`, LOS 53.9% — null. Paired validation loss said −0.0242,
+3.7× the 0.0065 seed floor, which looked like a clear win. Both are correct;
+the total is just the wrong statistic.
+
+**`Q_WEIGHT = 48` (`train.py:31`) means `total = policy + wdl + 48·q_mse`.**
+Splitting the final checkpoint's delta:
+
+| component | trained-on | held out | share of total |
+|---|---|---|---|
+| policy | −0.0057 | −0.0035 | 24% |
+| wdl | −0.0042 | −0.0020 | 17% |
+| 48 × q_mse | −0.0144 | −0.0096 | **59%** |
+| total | −0.0242 | −0.0151 | |
+
+The Q term moved 0.0041 → 0.0038 MSE — RMS error on expected value 0.064 →
+0.062 — and the 48× weight presents that as 0.014 nats. On the components the
+engine consumes, policy and wdl, the change is under the noise floor.
+
+**Do not quote total paired loss for any change that shifts the policy/value
+mix. Always split it.** The earlier calibration points (qk16, qk64, cosine
+taper) were never split and should be re-read before the ~1600–2500 Elo/nat
+range is trusted.
+
+Held-out validation clears the memorisation worry: **62% of the gain survives
+out of sample** (−0.0151 of −0.0242), in line with the 10-block net's 56%. The
+gain is real, just small. The engine was also searching ~8% fewer nodes at the
+time of the match, worth about −4 Elo, so quality-per-node is plausibly ~+5.
+
+#### Throughput: −16% datagen, −24% search. The cost is node count.
+
+| | baseline | rank 4 | |
+|---|---|---|---|
+| datagen, batch 284, CUDA graph | 70.0K | 58.5K | −16.4% |
+| search, batch 32, no CUDA graph | 27.5K | 20.5K | −25.5% |
+| search, batch 32, CUDA graph | 34.0K | 26.0K | −23.5% |
+
+Predicted +1%. Two mechanisms, neither of which is the new arithmetic.
+
+**1. The extra bias add un-fuses `BiasSoftmax`.** Confirmed by
+`SZ0_DUMP_OPTIMIZED=dynbias_opt.onnx ./SZ0` + `inspect_graph.py --raw`:
+`BiasSoftmax` went **10 → 0**, replaced by `Softmax ×10` and raw `Add`s; the
+graph went 322 → 462 nodes. The scores tensor is the largest in the net
+(8·64·64 = 64 KB/position/block) and it now round-trips through memory two
+extra times per block.
+
+Reordering the adds cannot be replaced by *summing* the two biases first:
+`(1,h,64,64) + (b,1,64,64) → (b,h,64,64)`, a tensor the same size as the
+scores, so you write a full-size tensor to avoid reading one. Per block per
+position, in 64 KB units:
+
+| | matmul | bias adds | softmax | total |
+|---|---|---|---|---|
+| baseline | w1 | *(fused)* | r1+w1 | 192 KB |
+| current | w1 | r1+w1, r1+w1 | r1+w1 | 456 KB |
+| pre-summed biases | w1 | w1 | r2+w1 | 320 KB |
+| reordered | w1 | r1+w1 | r1+w1 | 320 KB |
+
+`BiasSoftmax` needs a bias that broadcasts on the outer or inner dims;
+`spatial_bias` is `(1,h,64,64)` and fuses, the dynamic map is `(b,1,64,64)` and
+broadcasts on the **head** axis, which is neither. So the fix is to put the
+dynamic add *first*, leaving the fusable constant adjacent to the softmax —
+one line at `architecture.py:159-163`, no change to the function computed.
+
+**2. Per-kernel overhead on a 43% larger graph — the bigger half.** Fitting the
+two graph-on measurements to `cost = a + b·batch`:
+
+```
++290 µs = a +  32b   =>   a = 225 µs per batch (fixed)
++799 µs = a + 284b        b = 2.02 µs per position
+```
+
+Both terms are independently confirmable: **225 µs / 140 nodes = 1.61 µs per
+node**, textbook captured-graph per-kernel overhead; and **2.02 µs/pos ×
+864 GB/s = 1.75 MB/pos**, against the 2.64 MB/pos the round-trip model predicts
+with roughly a third L2-served (the scores tensor is 18.6 MB at batch 284,
+2.1 MB at batch 32, both inside the L40S's 48 MB L2).
+
+So it is ~⅓ bandwidth and ~⅔ per-kernel overhead. At batch 32 the fixed term
+alone is 24% of the entire forward pass.
+
+**CUDA graph capture does not fix this.** It removes CPU-side launch overhead
+(−25.5% → −23.5%, about 0.76 µs/node), but a captured graph still executes 462
+kernels in sequence and each retains ~1.6 µs of GPU-side scheduling regardless
+of how little work it does.
+
+**Consequence: the QK-concat idea is withdrawn.** `S + U Vᵀ` is algebraically
+the score contribution of `r` extra QK dims, so concatenating `U` onto q and
+`Vᵀ` onto k folds the whole thing into the existing `FusedMatMul` — an elegant
+bandwidth fix. But it removes one `Add` while adding `Expand`+`Concat` ×2 per
+block, i.e. *more* nodes, and node count is the dominant term.
+
+**Verdict: rejected as implemented.** The reorder is free and worth doing
+(predicted datagen 58.5K → ~64.5K, search 26K → ~27.6K) but still leaves −8%
+and −19% for ~+5 Elo, against depth's 0.87 Elo per % of nps. A per-block
+Smolgen branch is ~14 tiny kernels amortised over a `d_model=256` block that
+takes ~94 µs at batch 32; Leela's design assumes a much larger net. The only
+variants with a path are one branch shared across all 10 blocks (140 → ~24
+nodes, ≈ −7%) or applying it to a subset of blocks — both of which would also
+shrink the ~+5 Elo.
+
+#### Generalisable: predict throughput from the graph, not from arithmetic
+
+The most useful throughput lesson of the project so far. Two rules, both
+learned by being wrong here:
+
+1. **On a fused graph, the cost of a new op is dominated by which fusion it
+   breaks, not by its own FLOPs or bytes.** The +1% estimate counted the new
+   ops' traffic correctly and was irrelevant.
+2. **On a small model, cost is dominated by node count, not by work.** At
+   `d_model=256` every kernel is tiny, so ~1.6 µs of per-kernel overhead
+   swamps the arithmetic. CUDA graph capture reduces this but does not remove
+   it.
+
+Always dump the optimised graph and diff the fused-op counts before predicting
+the cost of an architecture change.
+
+### Policy head width 64 → 256 — implemented, not yet trained
+
+`architecture.py` field `d_policy_head` (default 64, unchanged). The policy head
+is a single bilinear form:
+
+```
+policy[i,j] = (x_i W_from) · (x_j W_to) = x_iᵀ A x_j,   A = W_from W_toᵀ
+```
+
+`A` is 256×256 and `d_policy_head` caps its rank, so 64 is a 4× restriction and
+256 removes it. Same algebra as `d_qk_head`, where this net proved very
+rank-sensitive (32→16 cost −37.5 Elo, 32→64 gained +20.9). The trunk carries 80
+bilinear forms of rank 64 (10 blocks × 8 heads); the entire 4096-way policy
+readout is one form of rank 64.
+
+**Pre-screen on `sz0_doubleqk_epoch6` (`scratchpad/policy_rank.py`)** — singular
+spectra of the trained projections, against a random-matrix baseline, since a
+flat spectrum only means something relative to one:
+
+| | observed | random 256×64 |
+|---|---|---|
+| `W_from` participation ratio | 57.8 / 64 | 59.9 |
+| `W_from` σ_max/σ_min | 4.1 | 2.88 |
+| `A` participation ratio | 44.7 / 64 | 55.8 |
+| `A` σ_max/σ_min | 11.8 | 4.57 |
+
+`A` is clearly structured, so the head has learned something real. But neither
+projection has dead directions — `W_from`'s smallest singular value is 0.98
+against a largest of 4.06, barely distinguishable from random. Weight decay 1e-4
+over 1.8M steps would have collapsed surplus output dimensions and did not.
+
+**Asymmetric conclusion: rules out "64 is already enough", does not prove 256
+helps** — a rank-64 truncation of a higher-rank optimum looks much the same.
+Caveat: for any single position the 64 tokens span at most a 64-dim subspace, so
+the cap never binds within one board; it binds across boards, because a rank-64
+`A` must reuse the same subspace for all of them.
+
+Cost, by the two rules above: **zero new nodes, zero fusions broken** — same two
+`Gemm`s and one `FusedMatMul`, just wider. +98,688 params (+1.7%), +14.2
+MFLOP/position, +96 KB/position of traffic. Predicted 2–4%, and this is the case
+where that arithmetic should hold, because both mechanisms that broke the
+dyn-bias prediction are structurally absent. Confirm node count is still 322 in
+the dumped graph before trusting it.
+
+Screen the result on the **policy** component, not the total — this change is
+policy-targeted, so the expected signature is the mirror image of the dyn bias
+(policy moves, value barely does).
 
 ### Kimi Attention Residuals — assessed, not run
 
