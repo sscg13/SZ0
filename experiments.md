@@ -42,6 +42,11 @@ not conclusions about any one change.
   ~1600.
 - Validate on **held-out** data. Roughly 55–60% of a capacity gain survives out
   of sample; the rest is fitting the training window.
+- **Pin the eval set.** `validation.py` globs `*.data`, so stray datagen output
+  silently changes it — the same `--vs` baseline read 2.3779 in one session and
+  2.3658 in another. Paired deltas within one invocation survive this; absolute
+  losses across sessions do not, which matters for any curve fitted over
+  checkpoints scored at different times.
 - **nps is comparable only at equal nodes/move**, and only at equal batch fill —
   fill decays through a run as games reach endgames.
 - **Verify a checkpoint's actual config immediately after training** (dump the
@@ -70,8 +75,18 @@ not conclusions about any one change.
 
 **Architecture**
 
-- `d_qk_head` and `d_policy_head` are **rank caps on bilinear forms**, and this
-  net is very rank-sensitive: qk 32→16 cost −37.5 Elo, 32→64 gained +20.9.
+- **The token count (64) is the ceiling for every per-token bilinear rank cap.**
+  `d_qk_head` and `d_policy_head` both cap the rank of a 256×256 form evaluated
+  as `x_iᵀ A x_j`. For a single position `x` has rank ≤ 64, so rank ≥ 64 leaves
+  that position's 64×64 map completely unconstrained; going higher only lets
+  *different* boards have more independent maps, which measured as nothing.
+  Predicts all three results: qk 32→16 (far below) −37.5 Elo, qk 32→64 (reaches
+  it) +20.9, policy 64→256 (already at it) null. **Do not raise any bilinear
+  rank cap above 64** — that closes `qk 128` on capacity grounds, which is
+  stronger than the cost grounds it was parked on.
+- **A widening is a superset in function space**, so it cannot be worse at the
+  optimum. A widened net scoring worse on *training-window* loss is an
+  optimizer/seed outcome, never a capacity finding.
 - Softmax over `j` discards anything constant along `j`, which kills every
   per-query additive term — see the logit algebra under run4.
 
@@ -454,7 +469,7 @@ sample. Noise floor ~0.0065 nats / ~10 Elo, so anything inside that is a null.
 | `d_ff` 256 → 512 | +0.0063 (confounded) | — | ~−10% | rejected |
 | Cosine `d_ff` taper | +0.0002 | +6.9 ± 15.8 | −4.3% | rejected |
 | Dynamic attention bias, rank 4 | −0.0151 held out | +0.9 ± 17.5 | −16.4% | rejected, revisit at larger `d_model` |
-| `d_policy_head` 64 → 256 | — | — | ~−3% predicted | **pending** |
+| `d_policy_head` 64 → 256 | +0.0099 | −9.6 ± 18.0 | ~−3% | rejected (null; rank cap was never binding) |
 | Attention residuals (Kimi) | — | — | ~−24% predicted | not run, premise measured false |
 | `QKᵀ + W1X + (XW2)ᵀ` | — | — | — | rejected on paper (per-query term cancels) |
 
@@ -471,7 +486,6 @@ Open follow-ups:
   optimisation rather than data; score the six dyn-bias checkpoints held out to
   settle which, then try an end-of-run LR anneal (cheap) before more data
   (expensive)
-- **policy head 64 → 256** — implemented, not yet trained; the last run4 item
 - datagen throughput budget — 70K at 300 nodes/move vs 95K originally; decide
   explicitly rather than letting adoptions erode it further
 - widen `d_model` — raises arithmetic intensity but also traffic, costly for
@@ -491,8 +505,15 @@ Open follow-ups:
   CLOCK` during datagen)
 
 Closed since this list was written: double-buffered datagen (done, 70K), a
-reserved held-out validation slice (done), per-layer `d_ff` schedule (tested and
-rejected — see the cosine taper below).
+reserved held-out validation slice (done), per-layer `d_ff` schedule (rejected —
+cosine taper), policy head width (rejected — null), `qk 128` (ruled out on
+capacity by the token-count ceiling).
+
+**Experiments are concluded. The adopted run4 architecture is 10 blocks,
+`d_model 256`, 8 heads, `d_qk_head 64`, `d_ff 256`, `d_policy_head 64`** — i.e.
+two changes from the 6-block baseline, both found early, with everything tried
+since coming back null or negative. Official run4 is a 5M+ step pretrain, which
+also tests the step-count prediction below.
 
 ### The baseline anchor is ~67 Elo below the iterative net
 
@@ -783,7 +804,7 @@ zero-init decode blocks gradient to the whole front end at step 0, since a zero
 kernel has zero Jacobian; it unfreezes at step 1. Zeroing *both* rank factors
 would trap them permanently — only `V` is zeroed.
 
-### Policy head width 64 → 256 — implemented, not yet trained
+### Policy head width 64 → 256 — null, rejected
 
 `architecture.py` field `d_policy_head` (default 64, unchanged). The policy head
 is a single bilinear form:
@@ -814,22 +835,45 @@ projection has dead directions — `W_from`'s smallest singular value is 0.98
 against a largest of 4.06, barely distinguishable from random. Weight decay 1e-4
 over 1.8M steps would have collapsed surplus output dimensions and did not.
 
-**Asymmetric conclusion: rules out "64 is already enough", does not prove 256
-helps** — a rank-64 truncation of a higher-rank optimum looks much the same.
-Caveat: for any single position the 64 tokens span at most a 64-dim subspace, so
-the cap never binds within one board; it binds across boards, because a rank-64
-`A` must reuse the same subspace for all of them.
+The pre-screen's conclusion was explicitly asymmetric: it rules out "64 is
+already enough", it does not prove 256 helps. The caveat noted at the time is
+the one that decided it — for any single position the 64 tokens span at most a
+64-dim subspace, so **the cap never binds within one board**; it binds only
+across boards, because a rank-64 `A` must reuse the same subspace for all of
+them.
 
-Cost, by the two rules above: **zero new nodes, zero fusions broken** — same two
-`Gemm`s and one `FusedMatMul`, just wider. +98,688 params (+1.7%), +14.2
-MFLOP/position, +96 KB/position of traffic. Predicted 2–4%, and this is the case
-where that arithmetic should hold, because both mechanisms that broke the
-dyn-bias prediction are structurally absent. Confirm node count is still 322 in
-the dumped graph before trusting it.
+Cost was as predicted for once: **zero new nodes, zero fusions broken** — same
+two `Gemm`s and one `FusedMatMul`, just wider. +98,688 params (+1.7%), +14.2
+MFLOP/position, +96 KB/position, ~3%.
 
-Screen the result on the **policy** component, not the total — this change is
-policy-targeted, so the expected signature is the mirror image of the dyn bias
-(policy moves, value barely does).
+#### Result: null, and the cross-board coupling is not binding
+
+Paired loss **+0.0099 ± 0.0017** (worse), match **−9.6 ± 18.0 pentanomial**,
+LOS 14.8%, pairs `[2, 54, 98, 45, 1]`. Both point the same way; neither is
+significant on its own.
+
+Two reasons to record this as **no signal** rather than as a regression:
+
+- **65% of the damage is in the value head, which this change does not touch.**
+  Policy +0.0035 on a base of 1.5239 (0.23%); value +0.0064 on 0.8419 (0.76%),
+  so the untouched half got 3.3× worse in relative terms. There is no mechanism
+  for that — a higher-capacity policy head absorbs more of the policy fitting
+  burden and should if anything *free* the trunk.
+- **`d_policy_head=256` strictly contains `d_policy_head=64` in function
+  space** (pad the rank-64 `A` with zeros), so at the optimum it cannot be
+  worse — and this is training-window loss, where extra parameters should look
+  better if anything. The regression is therefore provably an optimizer/seed
+  outcome, not a capacity finding.
+
+Expected neutral by the rank ceiling, observed neutral ± seed noise. Not
+adopted: ~3% throughput for an undemonstrated benefit, the same call as the
+cosine taper. Default stays 64; the parameter is kept because it documents the
+ceiling.
+
+**This is where the token-count ceiling in the standing rules comes from**, and
+it retroactively explains the whole `d_qk_head` curve — 32 was below the ceiling
+(hence the cliff at 16 and the gain at 64), the policy head was already at it.
+It also closes `qk 128` on capacity grounds rather than merely cost.
 
 ### Kimi Attention Residuals — assessed, not run
 
