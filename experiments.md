@@ -941,6 +941,111 @@ Will have more info as I gradually move to larger models.
 Batch 284 over 100 steps: 6 blocks ~2.0 s (14.2K pos/s), 10 blocks ~2.7 s
 (10.5K pos/s). 1.35× for 1.67× the FLOPs — overhead-bound rather than compute-bound.
 
+## Ideas for run5
+
+Staging area, nothing tested. Ordered cheapest-and-most-untested first. Every
+one of these is subject to the standing rules — in particular the ~10 Elo floor,
+so anything predicted sub-floor needs multiple seeds or should not be run.
+
+### Policy head: add the missing nonlinearity
+
+The policy head is **the only purely linear readout in the net** — the trunk's
+final LayerNorm feeds `p_from`/`p_to` directly. The value head has two
+activations, every block has SiLU.
+
+Lc0's attention policy head reportedly has an extra projection + nonlinearity
+before the QK mapping, and uses `d_policy = d_model`, which looks like it
+contradicts the token-count ceiling. It probably doesn't: **their single number
+does two jobs**, and the ceiling constrains only one.
+
+```
+t      = σ(W_p x)      # d_policy sets the width feeding the NONLINEARITY
+p_from = t W_from      # d_qk sets the RANK of the bilinear form
+```
+
+`t` is still (64, d) per position, so rank ≥ 64 still saturates the map — the
+ceiling holds. But `d_policy = d_model` means *no compression before the
+nonlinear step*, an entirely different claim. run4 moved the rank with no
+nonlinearity present, i.e. tested the one variable that could not help.
+
+Supporting evidence, retroactively: the pre-screen measured `A`'s participation
+ratio at **44.7 of 64 available** — the form was not using the rank it already
+had. That reading was ambiguous at the time (a truncated higher-rank optimum
+looks similar) but the null makes "not rank-starved" the supported one.
+
+Test, decoupling the two roles:
+
+```python
+t = nn.silu(dense(self.d_model)(x))       # new: 256 -> 256, nonlinear
+p_from = dense(self.d_policy_head)(t)     # keep 64
+p_to   = dense(self.d_policy_head)(t)
+```
+
+Cost is the cheap regime: **one** extra Dense plus an activation, not per block —
+~3 nodes on 322, +65k params, +8.4 MFLOP/position, one extra 32 KB/position
+tensor. Contrast the dyn bias's 140 nodes.
+
+Humility note: Lc0 has run far more compute than this project, so if they landed
+on `d_policy = d_model` there may be a reason beyond this reconstruction.
+
+### Value head: SiLU, and the 16/32 bottleneck
+
+Current head is `Dense(16)` per token → ReLU → flatten to 1024 → `Dense(32)` →
+ReLU → `Dense(3)`. The 16/32 widths date from run2's replacement of global
+pooling with per-token local compression.
+
+Two separable questions:
+
+- **ReLU → SiLU.** run3 tested exactly this swap in the FFN and got *neutral*,
+  so the prior is low. But the mechanism that would make it matter here is
+  width-dependent: a dead unit costs 1/16 or 1/32 of a layer rather than 1/256,
+  and SiLU has no dead-unit failure mode. So the FFN null does not transfer
+  cleanly. **Cheap diagnostic first:** measure the fraction of the 16 and 32
+  units that are zero across a real validation batch (`capture_intermediates`,
+  a few lines on top of `validation.py`). If nothing is dead, skip the
+  experiment; if a meaningful fraction is, the mechanism is real. Same shape as
+  the `policy_rank.py` screen — and note that screen's lesson: it was correct
+  but asymmetric, so a null diagnostic is weaker evidence than a positive one.
+- **The widths themselves.** The entire value estimate passes through **32
+  numbers** — by far the narrowest point in the net, against `d_model = 256` and
+  `d_ff = 256` everywhere else. Widening is nearly free: the whole head is ~37k
+  params (0.6%), and by the node-count rule adds zero nodes. This may be the
+  larger lever of the two, and the dyn-bias result is weak evidence for it —
+  that change's gain was 77% value-side, which says value capacity was the
+  binding axis.
+
+### Dynamic attention bias — revisit at larger `d_model`
+
+Rejected in run4 for cost, not quality: real gain (~+5 Elo, 62% held-out
+survival) at −16% datagen, because ~14 tiny kernels per block do not amortise at
+`d_model = 256`. Reconsider once `d_model` grows. If revisited, start from the
+cheap variants — one branch shared across all 10 blocks (140 → ~24 nodes) or a
+subset of blocks — and apply the add-reordering fix so `BiasSoftmax` still
+fuses. Full details under run4.
+
+### Widen `d_model`
+
+The main capacity lever left, and the one that gates the item above. Raises
+arithmetic intensity, which is the only way to move off the ~53%-of-bandwidth
+ceiling — but also raises traffic, so it is costly for datagen unless
+nodes/move can drop. Note the run4 evidence that depth costs full FLOPs price
+while width is partially discounted.
+
+### `num_heads` 8 → 16
+
+**Decouple `d_v_head` first** or it is three variables at once: the scores
+tensor doubles (largest tensor in the net), the spatial bias doubles (more
+expressive, and the bias was one of run3's biggest wins), and V's head dim
+silently halves to 16 — and a 32→16 head-dim cut on QK cost 37.5 Elo.
+Counter-evidence in its favour: run3 found 4 heads worse than 8, so
+more-heads-smaller-dim beat the reverse at constant `d_qk`.
+
+### Remove `b_K`
+
+Provably inert (see the logit algebra under run4), 0.09% of parameters. Left in
+place only because removing it breaks `StandardRestore` for every existing
+checkpoint, so it has to happen at a run boundary.
+
 ## sz0_run3
 
 ### Post-attention bias ablations / experiments
