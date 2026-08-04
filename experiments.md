@@ -603,21 +603,50 @@ Minor confound checked: `VALUE_WEIGHT`/`Q_WEIGHT` flipped from 48/1 to 1/48 on
 2026-03-25, so run3's early epochs used a different objective and its last ~15
 ran under the current one. Probably washed out.
 
-**Next: pretrain continues to 5.4M**, then official datagen and RL. Prediction to
-check against: `ln(5.4/3.6) × 0.0675 = −0.027`, so total should land near
-**−0.026** (run4 ahead).
+#### 5.4M: prediction validated a second time, and the policy gap priced
 
-One caution on reading that as Elo: run4 currently carries a 2.8×-floor value
-advantage and a 3.0×-floor policy deficit for a net +4.3 Elo, which is consistent
-with both components converting at similar rates — but one point cannot separate
-them, and the dyn-bias result hinted value-heavy gains convert poorly. If the
-remaining gains land mostly on value while policy stays structurally behind, the
-Elo return may be smaller than the total suggests.
+Predicted before the run: `ln(5.4/3.6) × 0.0675 = −0.027`, total near −0.026.
+**Observed −0.0225 ± 0.0027** — half a noise floor out, a second hit
+extrapolating beyond the fitted range. The log-law is usable for planning, not
+just retrospectively consistent. Match **+7.8 ± 17.8 pentanomial**, LOS 80.6%,
+pairs `[1, 47, 94, 58, 0]` — statistically indistinguishable from the +4.3 at
+3.6M.
 
-**Diagnostic that settles it, and the checkpoints already exist:** score 1.8M /
-2.4M / 3.0M against run3 on the same pinned set and watch the *policy* delta. If
-+0.0196 has been shrinking, steps will close it; if it is flat, it is the
-distillation gap and only a distillation pass will.
+The two checkpoints give the component rates directly:
+
+| | 3.6M | 5.4M | per e-fold |
+|---|---|---|---|
+| policy | +0.0196 | +0.0166 | 0.0074 |
+| value | −0.0184 | −0.0391 | 0.051 |
+| total | +0.0012 | −0.0225 | 0.0585 |
+
+**The policy gap is closing at 0.0074 nats per e-fold, so closing the remaining
+0.0166 needs 2.24 more e-folds ≈ 51M steps** — 14× more training, ~16 days of
+GPU. Technically steps, practically structural. Meanwhile value improves **7×
+faster**, and 87% of the last increment was value.
+
+**So pretraining stopped at 5.4M on the evidence, not as a compromise.** The next
+e-fold costs ~10 hours and buys almost purely value nats, which are converting
+badly across lineages: −0.0225 total (3.5× the floor) is worth +7.8 Elo, where
+the within-lineage rate would predict ~+36. Cross-lineage loss→Elo remains
+unreliable, as recorded above.
+
+**Why this is less bad than it looks.** run3's policy advantage is not a property
+of its architecture — it comes from the targets being MCTS visits produced by
+run3-lineage search, plus epoch28's distillation pass. Once run4 runs its own
+datagen the targets become run4-lineage, so the advantage **transfers rather than
+having to be overcome**. What 51M pretraining steps could not fix, the first RL
+iteration fixes by construction. run4 enters RL with a −0.039 value advantage,
+6× the noise floor and the largest clean margin measured in this project, on the
+component that guides search and therefore shapes the data.
+
+Two things to do at the boundary: **run a distillation pass on run4** (run3 got
+one, run4 has not — the cheapest available chunk of the policy gap, and the
+like-for-like comparison), and **re-measure against run3 after the first RL
+iteration** watching whether policy crosses. If the lineage explanation is right
+that delta should move far faster than 0.0074/e-fold once the data is run4's own,
+which is the check that confirms the diagnosis rather than leaving it a plausible
+story.
 
 ### 6 → 10 transformer blocks — adopted
 
